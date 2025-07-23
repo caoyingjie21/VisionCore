@@ -79,7 +79,7 @@ class QtVisionSick:
         
         # 尝试登录 - 在连接时登录，保持登录状态
         try:
-            self.deviceControl.login(Control.USERLEVEL_SERVICE, 'CUST_SERV')
+            self.deviceControl.login(Control.USERLEVEL_SERVICE, '123456')
         except Exception as e:
             self.deviceControl.login(Control.USERLEVEL_AUTH_CLIENT, 'CLIENT')
         
