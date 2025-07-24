@@ -1,27 +1,20 @@
-# SickVision 无界面系统配置文件
-# 版本: 2.0.0
-# 更新时间: 2024-01-01
-
-# 系统基础配置
 system:
-  name: "SickVision-Headless"
-  version: "2.0.0"
+  name: SickVision-Headless
+  version: 2.0.0
   debug: false
-  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  log_level: INFO
   max_workers: 4
-  
-# 相机配置
 camera:
   enabled: true
-  type: "SICK"
+  type: SICK
   connection:
-    ip: "192.168.10.5"
+    ip: 192.168.1.101
     port: 2122
     timeout: 10
   parameters:
     use_single_step: false
-    acquisition_mode: "continuous"
-    exposure_time: 50  # 微秒
+    acquisition_mode: continuous
+    exposure_time: 50
     gain: 1.0
   roi:
     enabled: true
@@ -29,43 +22,31 @@ camera:
     y: 0
     width: 640
     height: 480
-
-# 机器人配置
 robots:
   enabled: true
   max_connections: 4
   connection_timeout: 5
   heartbeat_interval: 1
-  
-  # 机器人列表
   devices:
-    - name: "epson1"
-      type: "epson"
-      enabled: true
-      connection:
-        ip: "192.168.10.55"
-        cmd_port: 60000
-        status_port: 60001
-      settings:
-        coordinate_system: "robot"
-        speed: 50
-        acceleration: 100
-        precision: 0.1
-      
-
-
-# AI模型配置
+  - name: epson1
+    type: epson
+    enabled: true
+    connection:
+      ip: 192.168.10.55
+      cmd_port: 60000
+      status_port: 60001
+    settings:
+      coordinate_system: robot
+      speed: 50
+      acceleration: 100
+      precision: 0.1
 model:
   enabled: true
-  platform: "auto"  # auto, rknn, pytorch
-  
-  # 模型路径配置
+  platform: auto
   paths:
-    windows: "models/best.pt"
-    linux_arm64: "models/obb_exported.float.rknn"
-    linux_x64: "models/best.pt"
-  
-  # 推理参数
+    windows: models/best.pt
+    linux_arm64: models/obb_exported.float.rknn
+    linux_x64: models/best.pt
   inference:
     conf_threshold: 0.7
     nms_threshold: 0.45
@@ -74,227 +55,173 @@ model:
     use_gpu: true
     use_fp16: false
     batch_size: 1
-  
-  # 模型预热
   warmup:
     enabled: true
     iterations: 3
-    dummy_input_size: [640, 640, 3]
-
-# 坐标转换配置
+    dummy_input_size:
+    - 640
+    - 640
+    - 3
 coordinate:
   enabled: true
-  transformation_matrix_file: "transformation_matrix.json"
-  
-  # 标定配置
+  transformation_matrix_file: transformation_matrix.json
   calibration:
     min_points: 4
     max_points: 20
     rmse_threshold: 10.0
     validation_enabled: true
-  
-  # 坐标系设置
   coordinate_systems:
-    camera: "camera"
-    robot: "robot"
-    world: "world"
-
-# MQTT配置
+    camera: camera
+    robot: robot
+    world: world
 mqtt:
   enabled: true
-  
-  # 连接配置
   connection:
-    broker_host: "localhost"
+    broker_host: localhost
     broker_port: 1883
     keepalive: 60
-    client_id: "sickvision_headless"
-    username: ""
-    password: ""
+    client_id: sickvision_headless
+    username: ''
+    password: ''
     use_ssl: false
-  
-  # QoS配置
   qos:
     subscribe: 1
     publish: 1
-  
-  # 主题配置
   topics:
-    # 订阅主题
     subscribe:
-      config_update: "sickvision/config/update"
-      control_start: "sickvision/control/start"
-      control_stop: "sickvision/control/stop"
-      detection_trigger: "sickvision/detection/trigger"
-      system_command: "sickvision/system/command"
-    
-    # 发布主题
+      config_update: sickvision/config/update
+      control_start: sickvision/control/start
+      control_stop: sickvision/control/stop
+      detection_trigger: sickvision/detection/trigger
+      system_command: sickvision/system/command
     publish:
-      config_reload_response: "sickvision/config/reload/response"
-      control_status: "sickvision/control/status"
-      detection_result: "sickvision/detection/result"
-      system_heartbeat: "sickvision/system/heartbeat"
-      system_error: "sickvision/system/error"
-      system_status: "sickvision/system/status"
-  
-  # 消息配置
+      config_reload_response: sickvision/config/reload/response
+      control_status: sickvision/control/status
+      detection_result: sickvision/detection/result
+      system_heartbeat: sickvision/system/heartbeat
+      system_error: sickvision/system/error
+      system_status: sickvision/system/status
   message:
     retain: false
     compression: false
-    max_payload_size: 1048576  # 1MB
-
-# REST API配置
+    max_payload_size: 1048576
 api:
   enabled: true
-  
-  # 服务器配置
   server:
-    host: "0.0.0.0"
+    host: 0.0.0.0
     port: 8000
     workers: 1
     reload: false
-  
-  # 安全配置
   security:
     cors_enabled: true
-    cors_origins: ["*"]
+    cors_origins:
+    - '*'
     rate_limit_enabled: false
     rate_limit_requests: 100
     rate_limit_window: 60
-  
-  # 文档配置
   docs:
     enabled: true
-    title: "SickVision API"
-    description: "SickVision无界面视觉系统API接口"
-    version: "2.0.0"
-    swagger_url: "/docs"
-    redoc_url: "/redoc"
-
-# 工作流配置
+    title: SickVision API
+    description: SickVision无界面视觉系统API接口
+    version: 2.0.0
+    swagger_url: /docs
+    redoc_url: /redoc
 workflow:
   enabled: true
-  
-  # 状态机配置
   state_machine:
-    initial_state: "idle"
+    initial_state: idle
     timeout: 30
     max_retries: 3
-  
-  # 检测流程配置
   detection:
     auto_start: false
-    trigger_mode: "manual"  # manual, plc, mqtt, api
+    trigger_mode: manual
     detection_timeout: 10
     result_timeout: 5
-    
-  # PLC集成配置
   plc:
     enabled: false
-    signal_types: ["next", "ready", "busy", "error", "heartbeat"]
-    anti_bounce_time: 2  # 秒
+    signal_types:
+    - next
+    - ready
+    - busy
+    - error
+    - heartbeat
+    anti_bounce_time: 2
     status_update_interval: 0.1
-
-# 稳定性配置
 stability:
   enabled: true
   max_attempts: 7
   coord_threshold: 3.0
   angle_threshold: 5.0
   consistency_check: true
-
-# 日志配置
 logging:
   enabled: true
-  
-  # 日志级别
-  level: "INFO"
-  
-  # 文件配置
+  level: INFO
   file:
     enabled: true
-    path: "logs"
-    filename: "sickvision_{date}.log"
-    max_size: "10MB"
+    path: logs
+    filename: sickvision_{date}.log
+    max_size: 10MB
     backup_count: 30
-    rotation: "daily"
-  
-  # 控制台配置
+    rotation: daily
   console:
     enabled: true
-    format: "[{time:YYYY-MM-DD HH:mm:ss}] {level} | {name} | {message}"
-  
-  # 日志模块配置
+    format: '[{time:YYYY-MM-DD HH:mm:ss}] {level} | {name} | {message}'
   loggers:
-    - name: "VisionCore"
-      level: "INFO"
-    - name: "ConfigManager"
-      level: "DEBUG"
-    - name: "MQTT"
-      level: "INFO"
-    - name: "API"
-      level: "INFO"
-
-# 监控配置
+  - name: VisionCore
+    level: INFO
+  - name: ConfigManager
+    level: DEBUG
+  - name: MQTT
+    level: INFO
+  - name: API
+    level: INFO
 monitoring:
   enabled: true
-  
-  # 性能监控
   performance:
     enabled: true
-    metrics_interval: 10  # 秒
+    metrics_interval: 10
     cpu_threshold: 80
     memory_threshold: 80
     disk_threshold: 90
-  
-  # 健康检查
   health_check:
     enabled: true
-    interval: 30  # 秒
+    interval: 30
     timeout: 5
     endpoints:
-      - name: "camera"
-        check_type: "connection"
-      - name: "robots"
-        check_type: "connection"
-      - name: "mqtt"
-        check_type: "connection"
-
-# 热重载配置
+    - name: camera
+      check_type: connection
+    - name: robots
+      check_type: connection
+    - name: mqtt
+      check_type: connection
 hot_reload:
   enabled: true
-  
-  # 文件监控配置
   file_watch:
     enabled: true
-    patterns: ["*.yaml", "*.json"]
-    ignore_patterns: ["*.tmp", "*.bak"]
-    debounce_interval: 1  # 秒
-  
-  # 重载策略
+    patterns:
+    - '*.yaml'
+    - '*.json'
+    ignore_patterns:
+    - '*.tmp'
+    - '*.bak'
+    debounce_interval: 1
   reload_strategy:
     graceful_shutdown: true
-    max_reload_time: 30  # 秒
+    max_reload_time: 30
     backup_config: true
     rollback_on_error: true
-  
-  # 通知配置
   notifications:
     mqtt_enabled: true
     log_enabled: true
     api_callback_enabled: false
-
-# 开发配置
 development:
   enabled: false
   mock_hardware: false
   simulation_mode: false
-  test_data_path: "test/data"
-  
-# 生产配置
+  test_data_path: test/data
 production:
   enabled: true
   strict_validation: true
   error_recovery: true
   auto_restart: true
-  backup_frequency: "daily"
+  backup_frequency: daily
