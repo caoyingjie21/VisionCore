@@ -126,7 +126,7 @@ class MqttClient:
                 
                 # 等待连接完成
                 await self._wait_for_connection()
-                
+    
                 self.logger.info("MQTT连接成功")
                 return True
             else:

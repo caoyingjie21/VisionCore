@@ -9,7 +9,7 @@ VisionCore 主程序入口
 import sys
 import time
 import signal
-from utils.initializers import SystemInitializer
+from System.SystemInitializer import SystemInitializer
 
 
 class VisionCoreApp:
