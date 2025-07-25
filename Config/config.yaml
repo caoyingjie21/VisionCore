@@ -1,79 +1,17 @@
 system:
   name: SickVision-Headless
-  version: 2.0.0
+  version: 1.0.0
   debug: false
   log_level: INFO
   max_workers: 4
 camera:
-  enabled: true
+  enabled: false
   type: SICK
   connection:
     ip: 192.168.1.101
     port: 2122
     timeout: 10
-  parameters:
-    use_single_step: false
-    acquisition_mode: continuous
-    exposure_time: 50
-    gain: 1.0
-  roi:
-    enabled: true
-    x: 0
-    y: 0
-    width: 640
-    height: 480
-robots:
-  enabled: true
-  max_connections: 4
-  connection_timeout: 5
-  heartbeat_interval: 1
-  devices:
-  - name: epson1
-    type: epson
-    enabled: true
-    connection:
-      ip: 192.168.10.55
-      cmd_port: 60000
-      status_port: 60001
-    settings:
-      coordinate_system: robot
-      speed: 50
-      acceleration: 100
-      precision: 0.1
-model:
-  enabled: true
-  platform: auto
-  paths:
-    windows: models/best.pt
-    linux_arm64: models/obb_exported.float.rknn
-    linux_x64: models/best.pt
-  inference:
-    conf_threshold: 0.7
-    nms_threshold: 0.45
-    input_size: 640
-    max_detections: 100
-    use_gpu: true
-    use_fp16: false
-    batch_size: 1
-  warmup:
-    enabled: true
-    iterations: 3
-    dummy_input_size:
-    - 640
-    - 640
-    - 3
-coordinate:
-  enabled: true
-  transformation_matrix_file: transformation_matrix.json
-  calibration:
-    min_points: 4
-    max_points: 20
-    rmse_threshold: 10.0
-    validation_enabled: true
-  coordinate_systems:
-    camera: camera
-    robot: robot
-    world: world
+    protocol: Cola2
 mqtt:
   enabled: true
   connection:
@@ -85,8 +23,8 @@ mqtt:
     password: ''
     use_ssl: false
   qos:
-    subscribe: 1
-    publish: 1
+    subscribe: 2
+    publish: 2
   topics:
     subscribe:
       config_update: sickvision/config/update
@@ -105,54 +43,6 @@ mqtt:
     retain: false
     compression: false
     max_payload_size: 1048576
-api:
-  enabled: true
-  server:
-    host: 0.0.0.0
-    port: 8000
-    workers: 1
-    reload: false
-  security:
-    cors_enabled: true
-    cors_origins:
-    - '*'
-    rate_limit_enabled: false
-    rate_limit_requests: 100
-    rate_limit_window: 60
-  docs:
-    enabled: true
-    title: SickVision API
-    description: SickVision无界面视觉系统API接口
-    version: 2.0.0
-    swagger_url: /docs
-    redoc_url: /redoc
-workflow:
-  enabled: true
-  state_machine:
-    initial_state: idle
-    timeout: 30
-    max_retries: 3
-  detection:
-    auto_start: false
-    trigger_mode: manual
-    detection_timeout: 10
-    result_timeout: 5
-  plc:
-    enabled: false
-    signal_types:
-    - next
-    - ready
-    - busy
-    - error
-    - heartbeat
-    anti_bounce_time: 2
-    status_update_interval: 0.1
-stability:
-  enabled: true
-  max_attempts: 7
-  coord_threshold: 3.0
-  angle_threshold: 5.0
-  consistency_check: true
 logging:
   enabled: true
   level: INFO
@@ -175,53 +65,3 @@ logging:
     level: INFO
   - name: API
     level: INFO
-monitoring:
-  enabled: true
-  performance:
-    enabled: true
-    metrics_interval: 10
-    cpu_threshold: 80
-    memory_threshold: 80
-    disk_threshold: 90
-  health_check:
-    enabled: true
-    interval: 30
-    timeout: 5
-    endpoints:
-    - name: camera
-      check_type: connection
-    - name: robots
-      check_type: connection
-    - name: mqtt
-      check_type: connection
-hot_reload:
-  enabled: true
-  file_watch:
-    enabled: true
-    patterns:
-    - '*.yaml'
-    - '*.json'
-    ignore_patterns:
-    - '*.tmp'
-    - '*.bak'
-    debounce_interval: 1
-  reload_strategy:
-    graceful_shutdown: true
-    max_reload_time: 30
-    backup_config: true
-    rollback_on_error: true
-  notifications:
-    mqtt_enabled: true
-    log_enabled: true
-    api_callback_enabled: false
-development:
-  enabled: false
-  mock_hardware: false
-  simulation_mode: false
-  test_data_path: test/data
-production:
-  enabled: true
-  strict_validation: true
-  error_recovery: true
-  auto_restart: true
-  backup_frequency: daily

@@ -111,76 +111,16 @@ class QtVisionSick:
         
         self.is_connected = True
         return True
-
-    @require_connection
-    def get_latest_frame(self, flush_count=2):
-        """
-        获取最新的帧数据，清空缓冲区确保获取真正最新的帧
-        
-        Args:
-            flush_count (int): 清空缓冲区的帧数，默认为2
-            
-        Returns:
-            tuple: (success, depth_data, intensity_image, camera_params)
-                success (bool): 是否成功获取数据
-                depth_data (list): 深度图数据
-                intensity_image (numpy.ndarray): 强度图
-                camera_params: 相机参数对象
-        """
-        # 连续流模式下，使用安全的缓冲区清空策略
-        try:
-            # 备份当前socket超时设置
-            old_timeout = self.streaming_device.sock_stream.gettimeout()
-            
-            # 设置较短的超时时间来检测缓冲区状态
-            self.streaming_device.sock_stream.settimeout(0.05)  # 50ms超时
-            
-            frames_flushed = 0
-            # 安全地读取并丢弃旧帧
-            for i in range(flush_count):
-                try:
-                    # 完整读取一帧来保持数据包边界
-                    self.streaming_device.getFrame()
-                    frames_flushed += 1
-                    
-                except socket.timeout:
-                    # 超时表示缓冲区已空，这是正常情况
-                    break
-                except Exception as e:
-                    # 其他异常，记录并退出
-                    break
-            
-            # 恢复原始超时设置
-            self.streaming_device.sock_stream.settimeout(old_timeout)
-            
-            # 现在获取最新的帧
-            return self._get_frame_data()
-            
-        except Exception as e:
-            # 确保恢复超时设置
-            try:
-                self.streaming_device.sock_stream.settimeout(old_timeout)
-            except:
-                pass
-                
-            # 降级到普通获取方法
-            return self.get_frame()
-
-    @require_connection
-    def get_frame(self):
-        """
-        获取当前帧数据
-        
-        Returns:
-            tuple: (success, depth_data, intensity_image, camera_params)
-                success (bool): 是否成功获取数据
-                depth_data (list): 深度图数据
-                intensity_image (numpy.ndarray): 强度图
-                camera_params: 相机参数对象
-        """
-        # 获取帧数据
-        return self._get_frame_data()
     
+    def get_camera_params(self):
+        """
+        获取相机参数
+        
+        Returns:
+            camera_params: 相机参数对象，如果未获取过帧数据则返回None
+        """
+        return getattr(self, 'camera_params', None)
+
     def _get_frame_data(self):
         """
         内部方法：获取并处理帧数据
@@ -208,15 +148,60 @@ class QtVisionSick:
         # 保存相机参数
         self.camera_params = myData.cameraParams
         return True, distance_data, adjusted_image, self.camera_params
-    
-    def get_camera_params(self):
+
+    @require_connection
+    def get_frame(self):
         """
-        获取相机参数
+        获取当前帧数据
         
         Returns:
-            camera_params: 相机参数对象，如果未获取过帧数据则返回None
+            tuple: (success, depth_data, intensity_image, camera_params)
+                success (bool): 是否成功获取数据
+                depth_data (list): 深度图数据
+                intensity_image (numpy.ndarray): 强度图
+                camera_params: 相机参数对象
         """
-        return getattr(self, 'camera_params', None)
+        # 获取帧数据
+        return self._get_frame_data()
+
+    @require_connection
+    def get_fresh_frame(self):
+        """
+        获取较新的帧数据，适用于需要较新数据但不想冒数据包错误风险的场景
+        
+        Returns:
+            tuple: (success, depth_data, intensity_image, camera_params)
+        """
+        # 连续流模式下，执行一次额外读取来获取更新的帧
+        try:
+            # 备份当前socket超时设置
+            old_timeout = self.streaming_device.sock_stream.gettimeout()
+            
+            # 设置较短的超时时间
+            self.streaming_device.sock_stream.settimeout(0.03)  # 30ms超时
+            
+            try:
+                # 尝试读取一帧来获取更新的数据
+                self.streaming_device.getFrame()
+            except socket.timeout:
+                # 超时是正常的，表示没有额外的缓冲数据
+                pass
+            
+            # 恢复原始超时设置
+            self.streaming_device.sock_stream.settimeout(old_timeout)
+            
+            # 获取当前帧
+            return self._get_frame_data()
+            
+        except Exception as e:
+            # 确保恢复超时设置
+            try:
+                self.streaming_device.sock_stream.settimeout(old_timeout)
+            except:
+                pass
+                
+            # 降级到普通获取方法
+            return self.get_frame()
             
     @safe_disconnect  
     def disconnect(self):

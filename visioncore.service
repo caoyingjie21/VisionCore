@@ -1,0 +1,43 @@
+[Unit]
+Description=VisionCore Headless Vision System
+Documentation=VisionCore无界面视觉系统
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/VisionCore
+ExecStart=/usr/bin/python3 /opt/VisionCore/main.py
+ExecReload=/bin/kill -HUP $MAINPID
+
+# 自动重启配置
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# 环境变量
+Environment=PYTHONPATH=/opt/VisionCore
+Environment=PYTHONUNBUFFERED=1
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=visioncore
+
+# 安全配置
+NoNewPrivileges=true
+PrivateTmp=true
+
+# 资源限制
+LimitNOFILE=65536
+MemoryMax=1G
+
+# 超时配置
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target 

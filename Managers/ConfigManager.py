@@ -42,7 +42,7 @@ class ConfigLoadError(Exception):
 class ConfigManager:
     """简化的配置管理器"""
     
-    def __init__(self, config_path: str = "Config/config.yaml"):
+    def __init__(self, config_path: str):
         """
         初始化配置管理器
         
