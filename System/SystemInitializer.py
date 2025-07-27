@@ -12,11 +12,12 @@ import os
 import asyncio
 import time
 import platform as plt
-from typing import Tuple, Optional, Any, Dict
+from typing import Tuple, Optional, Any, Dict, Callable
 
 from Managers.ConfigManager import ConfigManager
 from Managers.LogManager import LogManager
 from Mqtt.MqttClient import MqttClient
+from TcpServer.TcpServer import TcpServer
 from .SystemMonitor import SystemMonitor
 
 
@@ -286,6 +287,103 @@ class SystemInitializer:
         
         self.logger.error("检测器初始化最终失败")
         return False
+    
+    def initialize_tcp_server(self, max_retries: int = 3) -> bool:
+        """
+        初始化TCP服务器
+        
+        Args:
+            max_retries: 最大重试次数
+            
+        Returns:
+            bool: 初始化是否成功
+        """
+        if not self.config_mgr or not self.logger:
+            return False
+            
+        tcp_config = self.config_mgr.get_config("tcp_server")
+        
+        if not tcp_config or not tcp_config.get("enabled", False):
+            self.logger.info("TCP服务器功能已禁用")
+            return True  # 禁用时也认为是成功的
+        
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(f"正在初始化TCP服务器... (尝试 {attempt + 1}/{max_retries})")
+                
+                # 创建TCP服务器实例（不设置回调，留给main.py处理）
+                tcp_server = TcpServer(tcp_config, self.logger)
+                
+                # 启动TCP服务器
+                if tcp_server.start():
+                    self.logger.info("TCP服务器启动成功")
+                    self.resources['tcp_server'] = tcp_server
+                    return True
+                else:
+                    self.logger.error(f"TCP服务器启动失败 (尝试 {attempt + 1}/{max_retries})")
+                
+            except Exception as e:
+                self.logger.error(f"TCP服务器初始化失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # 递增等待时间
+                    self.logger.info(f"等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+                else:
+                    self.logger.error("TCP服务器初始化最终失败")
+        
+        return False
+    
+    def create_tcp_message_handler(self, catch_handler: Optional[Callable] = None):
+        """
+        创建TCP消息处理器函数，供main.py使用
+        
+        Args:
+            catch_handler: 外部提供的catch指令处理函数
+        
+        Returns:
+            Callable: 消息处理函数
+        """
+        def handle_tcp_message(client_id: str, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            """
+            处理TCP消息的统一入口
+            
+            Args:
+                client_id: 客户端ID
+                message: 接收到的消息
+                
+            Returns:
+                Optional[Dict]: 响应消息，如果为None则不回复
+            """
+            try:
+                message_type = message.get("type", "unknown")
+                
+                if message_type == "catch":
+                    if catch_handler:
+                        return catch_handler(client_id, message)
+                    else:
+                        return {
+                            "type": "catch_response",
+                            "success": False,
+                            "message": "catch处理器未设置",
+                            "timestamp": time.time()
+                        }
+                else:
+                    self.logger.debug(f"未处理的消息类型: {message_type} from {client_id}")
+                    return {
+                        "type": "error",
+                        "message": f"不支持的消息类型: {message_type}",
+                        "timestamp": time.time()
+                    }
+                    
+            except Exception as e:
+                self.logger.error(f"处理TCP消息时出错: {e}")
+                return {
+                    "type": "error",
+                    "message": f"消息处理失败: {str(e)}",
+                    "timestamp": time.time()
+                }
+        
+        return handle_tcp_message
     
     def _get_model_path(self) -> Optional[str]:
         """
@@ -621,11 +719,12 @@ class SystemInitializer:
             mqtt_success = self.initialize_mqtt_client()
             camera_success = self.initialize_camera()
             detector_success = self.initialize_detector()  # 根据平台自动选择模型
+            tcp_server_success = self.initialize_tcp_server()
             
             # 设置系统监控
             self._setup_monitoring()
             
-            if mqtt_success and camera_success and detector_success:
+            if mqtt_success and camera_success and detector_success and tcp_server_success:
                 self.logger.info("系统组件初始化完成")
                 return True
             else:
@@ -663,6 +762,13 @@ class SystemInitializer:
         
         if self.resources.get('detector'):
             self.monitor.register_component('detector', self.resources['detector'])
+        
+        if self.resources.get('tcp_server'):
+            self.monitor.register_component(
+                'tcp_server',
+                self.resources['tcp_server'],
+                lambda: self._restart_tcp_server()
+            )
         
         # 启动监控
         self.monitor.start_monitoring()
@@ -728,9 +834,101 @@ class SystemInitializer:
             self.logger.error(f"MQTT客户端重启异常: {e}")
             return False
     
+    def _restart_tcp_server(self) -> bool:
+        """重启TCP服务器"""
+        try:
+            self.logger.info("正在重启TCP服务器...")
+            
+            # 清理旧TCP服务器
+            old_tcp_server = self.resources.get('tcp_server')
+            if old_tcp_server:
+                try:
+                    old_tcp_server.stop()
+                except:
+                    pass
+            
+            # 重新初始化TCP服务器
+            if self.initialize_tcp_server(max_retries=3):
+                if self.monitor and 'tcp_server' in self.monitor.components:
+                    self.monitor.components['tcp_server'] = self.resources['tcp_server']
+                self.logger.info("TCP服务器重启成功")
+                return True
+            else:
+                self.logger.error("TCP服务器重启失败")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"TCP服务器重启异常: {e}")
+            return False
+    
     def get_resource(self, name: str) -> Optional[Any]:
         """获取指定的资源"""
         return self.resources.get(name)
+    
+    # === 类型化资源获取方法 - 提供更好的IDE智能提示 ===
+    
+    def get_mqtt_client(self) -> Optional['MqttClient']:
+        """
+        获取MQTT客户端
+        
+        Returns:
+            MqttClient实例或None
+        """
+        return self.resources.get('mqtt_client')
+    
+    def get_tcp_server(self) -> Optional['TcpServer']:
+        """
+        获取TCP服务器
+        
+        Returns:
+            TcpServer实例或None
+        """
+        return self.resources.get('tcp_server')
+    
+    def get_camera(self) -> Optional[Any]:
+        """
+        获取相机实例
+        
+        Returns:
+            相机实例或None (类型取决于具体的相机实现)
+        """
+        return self.resources.get('camera')
+    
+    def get_detector(self) -> Optional[Any]:
+        """
+        获取检测器实例
+        
+        Returns:
+            检测器实例或None (类型取决于具体的检测器实现)
+        """
+        return self.resources.get('detector')
+    
+    def get_config_manager(self) -> Optional['ConfigManager']:
+        """
+        获取配置管理器
+        
+        Returns:
+            ConfigManager实例或None
+        """
+        return self.config_mgr
+    
+    def get_logger(self) -> Optional[logging.Logger]:
+        """
+        获取日志记录器
+        
+        Returns:
+            Logger实例或None
+        """
+        return self.logger
+    
+    def get_monitor(self) -> Optional['SystemMonitor']:
+        """
+        获取系统监控器
+        
+        Returns:
+            SystemMonitor实例或None
+        """
+        return self.monitor
     
     def get_system_status(self) -> Dict[str, Any]:
         """获取系统状态"""
@@ -780,6 +978,17 @@ class SystemInitializer:
         if self.logger:
             self.logger.info("正在清理系统资源...")
         
+        # 清理TCP服务器
+        tcp_server = self.resources.get('tcp_server')
+        if tcp_server:
+            try:
+                tcp_server.stop()
+                if self.logger:
+                    self.logger.info("TCP服务器已停止")
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"TCP服务器停止失败: {e}")
+        
         # 清理相机
         camera = self.resources.get('camera')
         if camera:
@@ -791,16 +1000,38 @@ class SystemInitializer:
                 if self.logger:
                     self.logger.error(f"相机断开连接失败: {e}")
         
-        # 清理RKNN检测器
+        # 清理检测器（根据类型选择正确的清理方法）
         detector = self.resources.get('detector')
         if detector:
             try:
-                detector.release()
-                if self.logger:
-                    self.logger.info("RKNN检测器已释放")
+                # 检查检测器类型并选择合适的清理方法
+                detector_type = type(detector).__name__
+                
+                if hasattr(detector, 'release'):
+                    # RKNN_YOLO类型，有release方法
+                    detector.release()
+                    if self.logger:
+                        self.logger.info(f"{detector_type}检测器已释放")
+                elif hasattr(detector, 'model') and hasattr(detector.model, 'cpu'):
+                    # ultralytics YOLO类型，将模型移到CPU并清理
+                    try:
+                        detector.model.cpu()  # 将模型移到CPU
+                        if hasattr(detector, 'predictor'):
+                            detector.predictor = None  # 清理预测器
+                        if self.logger:
+                            self.logger.info(f"{detector_type}检测器已清理")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.warning(f"{detector_type}检测器清理部分失败: {e}")
+                else:
+                    # 其他类型的检测器，尝试通用清理
+                    if self.logger:
+                        self.logger.info(f"{detector_type}检测器已移除（无特定清理方法）")
+                        
             except Exception as e:
                 if self.logger:
-                    self.logger.error(f"RKNN检测器释放失败: {e}")
+                    detector_type = type(detector).__name__ if detector else "Unknown"
+                    self.logger.error(f"{detector_type}检测器释放失败: {e}")
         
         # 清理MQTT客户端
         mqtt_client = self.resources.get('mqtt_client')
@@ -817,6 +1048,9 @@ class SystemInitializer:
             except Exception as e:
                 if self.logger:
                     self.logger.error(f"MQTT客户端断开失败: {e}")
+        
+        # 清理资源字典
+        self.resources.clear()
         
         if self.logger:
             self.logger.info("=== VisionCore 系统关闭 ===")
