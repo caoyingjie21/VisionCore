@@ -294,7 +294,7 @@ class VisionCoreApp:
             payload: 配置更新数据，包含要更新的配置项
         """
         logger = self.initializer.logger
-        logger.info("收到MQTT配置更新命令")
+        logger.info(f"收到MQTT系统命令: {payload}")
         
         try:
             if not isinstance(payload, dict):
@@ -420,6 +420,8 @@ class VisionCoreApp:
         except Exception as e:
             self.initializer.logger.error(f"清理备份文件时出错: {e}")
     
+    
+    
     def _restore_config_backup(self) -> bool:
         """恢复配置备份"""
         try:
@@ -494,7 +496,6 @@ class VisionCoreApp:
             config_data: 新的配置数据
         """
         logger = self.initializer.logger
-        
         try:
             logger.info("开始热重载配置...")
             
@@ -538,6 +539,15 @@ class VisionCoreApp:
                     logger.info("日志配置热重载成功")
                 else:
                     logger.error("日志配置热重载失败")
+            
+            # 检查模型相关配置更新
+            if "model" in config_data:
+                total_components += 1
+                if self._reload_detector():
+                    success_count += 1
+                    logger.info("检测器配置热重载成功")
+                else:
+                    logger.error("检测器配置热重载失败")
             
             # 如果没有指定组件，说明可能是系统级配置，不需要重启组件
             if total_components == 0:
@@ -594,6 +604,13 @@ class VisionCoreApp:
         except Exception:
             return False
     
+    def _reload_detector(self) -> bool:
+        """重启检测器以应用新配置"""
+        try:
+            return self.initializer._restart_detector()
+        except Exception:
+            return False
+    
     def _restart_system(self):
         """重启整个系统"""
         logger = self.initializer.logger
@@ -638,8 +655,28 @@ class VisionCoreApp:
                 # 获取当前配置
                 try:
                     import yaml
+                    import os
+                    import glob
                     with open(self.config_path, 'r', encoding='utf-8') as f:
                         current_config = yaml.safe_load(f)
+                    
+                    # 添加models键值对，检查Models目录下的RKNN和PT文件
+                    models_dir = "./Models"
+                    model_files = []
+                    if os.path.exists(models_dir):
+                        # 查找.rknn文件
+                        rknn_pattern = os.path.join(models_dir, "*.rknn")
+                        rknn_paths = glob.glob(rknn_pattern)
+                        
+                        # 查找.pt文件
+                        pt_pattern = os.path.join(models_dir, "*.pt")
+                        pt_paths = glob.glob(pt_pattern)
+                        
+                        # 合并所有模型文件名
+                        all_paths = rknn_paths + pt_paths
+                        model_files = [os.path.basename(path) for path in all_paths]
+                    
+                    current_config["models"] = model_files
                     
                     mqtt_client = self.initializer.get_mqtt_client()
                     if mqtt_client:

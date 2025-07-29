@@ -228,15 +228,15 @@ class SystemInitializer:
                         return True
                     else:
                         return False
+                    
+            
             finally:
                 loop.close()
-        
         except Exception as e:
             self.logger.error(f"MQTT客户端初始化异常: {e}")
             return False
-        
         return False
-    
+
     def initialize_camera(self, max_retries: int = None) -> bool:
         """
         初始化相机（不使用重试，失败时通过MQTT通知）
@@ -355,6 +355,13 @@ class SystemInitializer:
                 self._notify_component_failure("detector", error_msg)
                 return False
             
+            # 检查平台与模型兼容性
+            platform_compatible, platform_error = self._check_platform_model_compatibility(model_path)
+            if not platform_compatible:
+                self.logger.error(platform_error)
+                self._notify_component_failure("detector", platform_error)
+                return False
+            
             # 使用快速超时避免长时间阻塞
             import concurrent.futures
             
@@ -363,36 +370,57 @@ class SystemInitializer:
                     # 根据模型类型选择检测器
                     detector = self._create_detector(model_path)
                     if not detector:
-                        return None
+                        return {"result": None, "error": "检测器创建失败", "error_type": "creation_failed"}
                     
                     # 预热模型
                     self.logger.info("正在预热模型...")
-                    warmup_success = self._warmup_model(detector)
-                    return detector if warmup_success else detector  # 即使预热失败也返回检测器
+                    warmup_success, warmup_error = self._warmup_model_with_error(detector)
+                    if warmup_success:
+                        return {"result": detector, "error": None, "error_type": None}
+                    else:
+                        # 预热失败，释放检测器资源
+                        self.logger.error("模型预热失败，检测器初始化失败")
+                        try:
+                            if hasattr(detector, 'release'):
+                                detector.release()
+                            elif hasattr(detector, 'model') and hasattr(detector.model, 'cpu'):
+                                detector.model.cpu()
+                        except:
+                            pass
+                        return {"result": None, "error": f"模型预热失败: {warmup_error}", "error_type": "warmup_failed"}
                 except Exception as e:
-                    self.logger.debug(f"检测器创建异常: {e}")
-                    return None
+                    return {"result": None, "error": f"检测器创建异常: {str(e)}", "error_type": "creation_exception"}
             
             # 使用10秒超时（模型加载可能需要更长时间）
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(create_and_warmup_detector)
                 try:
-                    detector = future.result(timeout=10.0)  # 10秒超时
+                    result_data = future.result(timeout=10.0)  # 10秒超时
+                    detector = result_data["result"]
+                    error_msg = result_data["error"]
+                    error_type = result_data["error_type"]
                 except concurrent.futures.TimeoutError:
-                    self.logger.error("检测器初始化超时")
                     detector = None
+                    error_msg = "检测器初始化超时"
+                    error_type = "timeout"
                 except Exception as e:
-                    self.logger.error(f"检测器初始化执行异常: {e}")
                     detector = None
+                    error_msg = f"检测器初始化执行异常: {e}"
+                    error_type = "execution_exception"
             
             if detector:
                 self.logger.info("检测器初始化成功")
                 self.resources['detector'] = detector
                 return True
             else:
-                error_msg = "检测器初始化失败"
-                self.logger.error(error_msg)
-                self._notify_component_failure("detector", error_msg)
+                # 根据错误类型生成详细错误信息
+                if error_type in ["timeout", "execution_exception"]:
+                    final_error_msg = error_msg
+                else:
+                    final_error_msg = error_msg if error_msg else "检测器初始化失败"
+                
+                self.logger.error(final_error_msg)
+                self._notify_component_failure("detector", final_error_msg)
                 return False
         except Exception as e:
             error_msg = f"检测器初始化异常: {str(e)}"
@@ -400,6 +428,180 @@ class SystemInitializer:
             self._notify_component_failure("detector", error_msg)
             return False
     
+    def initialize_sftp_client(self, max_retries: int = None) -> bool:
+        """
+        初始化SFTP客户端（不使用重试，失败时通过MQTT通知）
+        
+        Args:
+            max_retries: 最大重试次数（忽略，SFTP客户端不重试）
+            
+        Returns:
+            bool: 初始化是否成功
+        """
+        if not self.config_mgr or not self.logger:
+            return False
+            
+        sftp_config = self.config_mgr.get_config("sftp")
+        
+        if not sftp_config or not sftp_config.get("enabled", False):
+            self.logger.info("SFTP功能已禁用")
+            return True  # 禁用时也认为是成功的
+        
+        try:
+            # 获取SFTP配置参数
+            host = sftp_config.get("host", "localhost")
+            port = sftp_config.get("port", 22)
+            username = sftp_config.get("username", "anonymous")
+            password = sftp_config.get("password", "")
+            private_key_path = sftp_config.get("private_key_path", None)
+            remote_path = sftp_config.get("remote_path", "/uploads")
+            
+            self.logger.info(f"正在连接SFTP服务器: {username}@{host}:{port}")
+            
+            # 使用快速超时避免长时间阻塞
+            import threading
+            import time
+            
+            result = {"success": False, "error": None, "client": None}
+            
+            def connect_sftp():
+                try:
+                    import paramiko
+                    
+                    # 创建SSH客户端
+                    ssh_client = paramiko.SSHClient()
+                    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    
+                    # 连接参数
+                    connect_kwargs = {
+                        "hostname": host,
+                        "port": port,
+                        "username": username,
+                        "timeout": 10  # SSH连接超时
+                    }
+                    
+                    # 认证方式：优先使用私钥，其次密码
+                    if private_key_path and os.path.exists(private_key_path):
+                        try:
+                            private_key = paramiko.RSAKey.from_private_key_file(private_key_path)
+                            connect_kwargs["pkey"] = private_key
+                            self.logger.info(f"使用私钥认证: {private_key_path}")
+                        except Exception as key_error:
+                            self.logger.warning(f"私钥加载失败，回退到密码认证: {key_error}")
+                            if password:
+                                connect_kwargs["password"] = password
+                    elif password:
+                        connect_kwargs["password"] = password
+                        self.logger.info("使用密码认证")
+                    else:
+                        raise Exception("未提供有效的认证信息（私钥或密码）")
+                    
+                    # 连接SSH
+                    ssh_client.connect(**connect_kwargs)
+                    
+                    # 创建SFTP客户端
+                    sftp_client = ssh_client.open_sftp()
+                    
+                    # 测试远程路径是否存在，不存在则尝试创建
+                    try:
+                        sftp_client.stat(remote_path)
+                        self.logger.info(f"远程路径已存在: {remote_path}")
+                    except FileNotFoundError:
+                        try:
+                            # 尝试创建目录（递归创建）
+                            self._create_remote_directory(sftp_client, remote_path)
+                            self.logger.info(f"远程路径已创建: {remote_path}")
+                        except Exception as mkdir_error:
+                            self.logger.warning(f"无法创建远程路径: {mkdir_error}")
+                    
+                    # 封装SFTP客户端信息
+                    sftp_wrapper = {
+                        "ssh_client": ssh_client,
+                        "sftp_client": sftp_client,
+                        "host": host,
+                        "port": port,
+                        "username": username,
+                        "remote_path": remote_path,
+                        "connected": True
+                    }
+                    
+                    result["success"] = True
+                    result["client"] = sftp_wrapper
+                    
+                except ImportError:
+                    result["error"] = "paramiko库未安装，请运行: pip install paramiko"
+                except Exception as e:
+                    result["error"] = str(e)
+            
+            # 创建daemon线程，超时后自动终止
+            thread = threading.Thread(target=connect_sftp, daemon=True)
+            start_time = time.time()
+            thread.start()
+            
+            # 轮询检查，每0.1秒检查一次，最多15秒
+            timeout_seconds = 15.0
+            while thread.is_alive() and (time.time() - start_time) < timeout_seconds:
+                time.sleep(0.1)
+            
+            if thread.is_alive():
+                # 超时了
+                error_msg = f"SFTP连接超时: {host}:{port} (15秒)"
+                self.logger.error(error_msg)
+                self._notify_component_failure("sftp", error_msg)
+                return False
+            elif result["error"]:
+                # 有异常
+                error_msg = f"SFTP连接失败: {result['error']}"
+                self.logger.error(error_msg)
+                self._notify_component_failure("sftp", error_msg)
+                return False
+            else:
+                # 正常完成
+                if result["success"] and result["client"]:
+                    self.logger.info(f"SFTP连接成功: {username}@{host}:{port}")
+                    self.resources['sftp_client'] = result["client"]
+                    return True
+                else:
+                    error_msg = f"SFTP连接失败: 未知错误"
+                    self.logger.error(error_msg)
+                    self._notify_component_failure("sftp", error_msg)
+                    return False
+                    
+        except Exception as e:
+            error_msg = f"SFTP客户端初始化异常: {str(e)}"
+            self.logger.error(error_msg)
+            self._notify_component_failure("sftp", error_msg)
+            return False
+    
+    def _create_remote_directory(self, sftp_client, remote_path: str):
+        """
+        递归创建远程目录
+        
+        Args:
+            sftp_client: SFTP客户端实例
+            remote_path: 远程路径
+        """
+        try:
+            # 标准化路径（使用正斜杠）
+            remote_path = remote_path.replace('\\', '/')
+            
+            # 分割路径
+            path_parts = remote_path.strip('/').split('/')
+            current_path = '/'
+            
+            for part in path_parts:
+                if part:  # 跳过空部分
+                    current_path = current_path.rstrip('/') + '/' + part
+                    try:
+                        sftp_client.stat(current_path)
+                    except FileNotFoundError:
+                        sftp_client.mkdir(current_path)
+                        self.logger.debug(f"创建远程目录: {current_path}")
+                        
+        except Exception as e:
+            self.logger.error(f"创建远程目录失败: {e}")
+            raise
+
     def initialize_tcp_server(self, max_retries: int = None) -> bool:
         """
         初始化TCP服务器（不使用重试，失败时通过MQTT通知）
@@ -515,9 +717,64 @@ class SystemInitializer:
         
         return handle_tcp_message
     
+    def _check_platform_model_compatibility(self, model_path: str) -> Tuple[bool, str]:
+        """
+        检查平台与模型的兼容性
+        
+        Args:
+            model_path: 模型文件路径
+            
+        Returns:
+            Tuple[bool, str]: (是否兼容, 错误信息)
+        """
+        try:
+            model_name = os.path.basename(model_path)
+            current_platform = plt.system().lower()
+            current_machine = plt.machine().lower()
+            
+            is_rknn_model = model_name.endswith('.rknn')
+            is_pytorch_model = model_name.endswith('.pt')
+            
+            # ARM平台兼容性检查
+            if current_machine in ['aarch64']:
+                if is_pytorch_model:
+                    error_msg = f"平台不兼容: ARM平台({current_machine})不支持PyTorch模型({model_name})，请使用RKNN模型"
+                    return False, error_msg
+                elif is_rknn_model:
+                    return True, ""
+                else:
+                    error_msg = f"平台不兼容: ARM平台({current_machine})需要RKNN模型，当前模型({model_name})格式不支持"
+                    return False, error_msg
+            
+            # Windows/x86平台兼容性检查
+            elif current_platform in ["windows"] or current_machine in ['x86_64', 'amd64']:
+                if is_rknn_model:
+                    error_msg = f"平台不兼容: Windows/x86平台不支持RKNN模型({model_name})，请使用PyTorch模型(.pt)"
+                    return False, error_msg
+                elif is_pytorch_model:
+                    return True, ""
+                else:
+                    error_msg = f"平台不兼容: Windows/x86平台需要PyTorch模型(.pt)，当前模型({model_name})格式不支持"
+                    return False, error_msg
+            
+            # 其他平台默认使用PyTorch
+            else:
+                if is_rknn_model:
+                    error_msg = f"平台不兼容: {current_platform}平台不支持RKNN模型({model_name})，请使用PyTorch模型(.pt)"
+                    return False, error_msg
+                elif is_pytorch_model:
+                    return True, ""
+                else:
+                    error_msg = f"平台不兼容: {current_platform}平台需要PyTorch模型(.pt)，当前模型({model_name})格式不支持"
+                    return False, error_msg
+                    
+        except Exception as e:
+            error_msg = f"平台兼容性检查异常: {str(e)}"
+            return False, error_msg
+    
     def _get_model_path(self) -> Optional[str]:
         """
-        根据当前平台自动选择模型路径（通过扫描Models目录）
+        根据配置中的selectedModel选择模型路径，如果未配置则根据平台自动选择
         
         Returns:
             模型文件路径或None
@@ -541,7 +798,24 @@ class SystemInitializer:
                 print(f"无法读取Models目录: {e}")
             return None
         
-        # 根据平台选择模型文件
+        # 首先检查配置中是否指定了selectedModel
+        if self.config_mgr:
+            model_config = self.config_mgr.get_config("model")
+            if model_config and "selectedModel" in model_config:
+                selected_model = model_config["selectedModel"]
+                if selected_model in files:
+                    if self.logger:
+                        self.logger.info(f"使用配置中指定的模型: {selected_model}")
+                    else:
+                        print(f"使用配置中指定的模型: {selected_model}")
+                    return os.path.join(models_dir, selected_model)
+                else:
+                    if self.logger:
+                        self.logger.warning(f"配置中指定的模型文件不存在: {selected_model}，回退到自动选择")
+                    else:
+                        print(f"配置中指定的模型文件不存在: {selected_model}，回退到自动选择")
+        
+        # 如果没有配置或配置的模型不存在，则根据平台自动选择
         if plt.machine().lower() in ['aarch64']:
             # ARM平台使用RKNN模型
             rknn_files = [f for f in files if f.endswith('.rknn')]
@@ -601,36 +875,120 @@ class SystemInitializer:
             检测器实例或None
         """
         try:
-            if model_path.endswith('.rknn'):
-                # 使用RKNN检测器
-                from Rknn.RknnYolo import RKNN_YOLO
-                detector = RKNN_YOLO(
-                    model_path=model_path,
-                    conf_threshold=0.7,
-                    nms_threshold=0.45
-                )
-                self.logger.info("创建RKNN检测器成功")
-                return detector
-                
-            elif model_path.endswith('.pt'):
-                # 使用PyTorch检测器（如果有的话）
-                # 这里可以根据实际情况导入对应的PyTorch检测器
-                try:
-                    from ultralytics import YOLO
-                    detector = YOLO(model_path)
-                    self.logger.info("创建PyTorch检测器成功")
-                    return detector
-                except ImportError:
-                    self.logger.error("ultralytics库未安装，无法使用PyTorch模型")
-                    return None
-            else:
-                self.logger.error(f"不支持的模型格式: {model_path}")
-                return None
+            
+            # 使用RKNN检测器
+            from Rknn.RknnYolo import RKNN_YOLO
+            detector = RKNN_YOLO(
+                model_path=model_path,
+                conf_threshold=0.7,
+                nms_threshold=0.45
+            )
+            self.logger.info("创建RKNN检测器成功")
+            return detector
                 
         except Exception as e:
             self.logger.error(f"创建检测器失败: {e}")
             return None
     
+    def _warmup_model_with_error(self, detector) -> Tuple[bool, Optional[str]]:
+        """
+        预热模型并返回详细错误信息（使用test.jpg测试图片）
+        
+        Args:
+            detector: 检测器实例
+            
+        Returns:
+            Tuple[bool, Optional[str]]: (预热是否成功, 错误信息)
+        """
+        try:
+            # 查找测试图片
+            test_image_path = "./Models/test.jpg"
+            
+            if not os.path.exists(test_image_path):
+                if self.logger:
+                    self.logger.warning(f"测试图片不存在: {test_image_path}，使用随机数据预热")
+                else:
+                    print(f"测试图片不存在: {test_image_path}，使用随机数据预热")
+                
+                # 回退到随机数据
+                import numpy as np
+                test_input = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
+            else:
+                # 加载测试图片
+                try:
+                    import cv2
+                    test_input = cv2.imread(test_image_path)
+                    if test_input is None:
+                        raise Exception("cv2无法读取图片")
+                    
+                    if self.logger:
+                        self.logger.info(f"使用测试图片进行预热: {test_image_path}")
+                        self.logger.info(f"图片尺寸: {test_input.shape}")
+                    else:
+                        print(f"使用测试图片进行预热: {test_image_path}")
+                        print(f"图片尺寸: {test_input.shape}")
+                    
+                except ImportError:
+                    if self.logger:
+                        self.logger.warning("OpenCV未安装，尝试使用PIL")
+                    try:
+                        from PIL import Image
+                        import numpy as np
+                        pil_image = Image.open(test_image_path)
+                        test_input = np.array(pil_image)
+                        
+                        # 确保是RGB格式
+                        if len(test_input.shape) == 3 and test_input.shape[2] == 3:
+                            # PIL默认是RGB，转换为BGR（如果需要）
+                            test_input = cv2.cvtColor(test_input, cv2.COLOR_RGB2BGR) if 'cv2' in locals() else test_input
+                        
+                        if self.logger:
+                            self.logger.info(f"使用PIL加载测试图片: {test_image_path}")
+                            self.logger.info(f"图片尺寸: {test_input.shape}")
+                    except ImportError:
+                        if self.logger:
+                            self.logger.warning("PIL也未安装，使用随机数据预热")
+                        # 回退到随机数据
+                        import numpy as np
+                        test_input = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
+                    except Exception as e:
+                        return False, f"PIL加载图片失败: {str(e)}"
+                except Exception as e:
+                    return False, f"OpenCV加载图片失败: {str(e)}"
+            
+            if self.logger:
+                self.logger.info("开始模型预热...")
+            else:
+                print("开始模型预热...")
+            
+            # 进行一次预热推理
+            try:
+                results = detector.detect(test_input)
+                detection_count = self._parse_rknn_results(results)
+                # 输出检测结果
+                if self.logger:
+                    self.logger.info(f"模型预热完成，检测到 {detection_count} 个目标")
+                else:
+                    print(f"模型预热完成，检测到 {detection_count} 个目标")
+                
+                return True, None
+                    
+            except Exception as e:
+                error_detail = str(e)
+                if self.logger:
+                    self.logger.warning(f"模型预热失败: {error_detail}")
+                else:
+                    print(f"模型预热失败: {error_detail}")
+                return False, error_detail
+            
+        except Exception as e:
+            error_detail = str(e)
+            if self.logger:
+                self.logger.error(f"模型预热异常: {error_detail}")
+            else:
+                print(f"模型预热异常: {error_detail}")
+            return False, error_detail
+
     def _warmup_model(self, detector) -> bool:
         """
         预热模型（使用test.jpg测试图片）
@@ -706,23 +1064,8 @@ class SystemInitializer:
             
             # 进行一次预热推理
             try:
-                if hasattr(detector, 'predict'):
-                    # PyTorch YOLO模型
-                    results = detector.predict(test_input, verbose=False)
-                    detection_count = self._parse_yolo_results(results)
-                    
-                elif hasattr(detector, 'inference'):
-                    # RKNN模型
-                    results = detector.inference(test_input)
-                    detection_count = self._parse_rknn_results(results)
-                    
-                else:
-                    if self.logger:
-                        self.logger.warning("检测器没有已知的推理方法")
-                    else:
-                        print("检测器没有已知的推理方法")
-                    return False
-                
+                results = detector.detect(test_input)
+                detection_count = self._parse_rknn_results(results)
                 # 输出检测结果
                 if self.logger:
                     self.logger.info(f"模型预热完成，检测到 {detection_count} 个目标")
@@ -850,11 +1193,12 @@ class SystemInitializer:
             camera_success = self.initialize_camera()
             detector_success = self.initialize_detector()  # 根据平台自动选择模型
             tcp_server_success = self.initialize_tcp_server()
+            sftp_success = self.initialize_sftp_client()
             
             # 设置系统监控
             self._setup_monitoring()
             
-            if mqtt_success and camera_success and detector_success and tcp_server_success:
+            if mqtt_success and camera_success and detector_success and tcp_server_success and sftp_success:
                 self.logger.info("系统组件初始化完成")
                 return True
             else:
@@ -893,13 +1237,24 @@ class SystemInitializer:
             )
         
         if self.resources.get('detector'):
-            self.monitor.register_component('detector', self.resources['detector'])
+            self.monitor.register_component(
+                'detector', 
+                self.resources['detector'],
+                lambda: self._restart_detector()
+            )
         
-        if self.resources.get('tcp_server'):
+        if self.resources.get('detectionServer'):
             self.monitor.register_component(
                 'tcp_server',
-                self.resources['tcp_server'],
+                self.resources['detectionServer'],
                 lambda: self._restart_tcp_server()
+            )
+        
+        if self.resources.get('sftp_client'):
+            self.monitor.register_component(
+                'sftp_client',
+                self.resources['sftp_client'],
+                lambda: self._restart_sftp_client()
             )
         
         # 启动监控
@@ -983,6 +1338,59 @@ class SystemInitializer:
             self.logger.error(f"MQTT客户端重启异常: {e}")
             return False
     
+    def _restart_detector(self) -> bool:
+        """重启检测器（单次尝试，失败时通过MQTT通知）"""
+        try:
+            self.logger.info("正在重启检测器...")
+            
+            # 清理旧检测器
+            old_detector = self.resources.get('detector')
+            if old_detector:
+                try:
+                    # 检查检测器类型并选择合适的清理方法
+                    detector_type = type(old_detector).__name__
+                    
+                    if hasattr(old_detector, 'release'):
+                        # RKNN_YOLO类型，有release方法
+                        old_detector.release()
+                        self.logger.info(f"{detector_type}检测器已释放")
+                    elif hasattr(old_detector, 'model') and hasattr(old_detector.model, 'cpu'):
+                        # ultralytics YOLO类型，将模型移到CPU并清理
+                        try:
+                            old_detector.model.cpu()  # 将模型移到CPU
+                            if hasattr(old_detector, 'predictor'):
+                                old_detector.predictor = None  # 清理预测器
+                            self.logger.info(f"{detector_type}检测器已清理")
+                        except Exception as e:
+                            self.logger.warning(f"{detector_type}检测器清理部分失败: {e}")
+                    else:
+                        # 其他类型的检测器，尝试通用清理
+                        self.logger.info(f"{detector_type}检测器已移除（无特定清理方法）")
+                        
+                except Exception as e:
+                    self.logger.warning(f"清理旧检测器时出现异常: {e}")
+                
+                # 从资源中移除
+                self.resources.pop('detector', None)
+            
+            # 重新初始化检测器（单次尝试）
+            if self.initialize_detector():
+                if self.monitor and 'detector' in self.monitor.components:
+                    self.monitor.components['detector'] = self.resources['detector']
+                self.logger.info("检测器重启成功")
+                
+                return True
+            else:
+                # initialize_detector失败时已经发送了MQTT通知，这里只记录日志
+                self.logger.error("检测器重启失败")
+                return False
+                
+        except Exception as e:
+            error_msg = f"检测器重启异常: {str(e)}"
+            self.logger.error(error_msg)
+            self._notify_component_failure("detector", error_msg)
+            return False
+    
     def _restart_tcp_server(self) -> bool:
         """重启TCP服务器（单次尝试，失败时通过MQTT通知）"""
         try:
@@ -1010,11 +1418,175 @@ class SystemInitializer:
             self.logger.error(f"TCP服务器重启异常: {e}")
             return False
     
+    def _restart_sftp_client(self) -> bool:
+        """重启SFTP客户端（单次尝试，失败时通过MQTT通知）"""
+        try:
+            self.logger.info("正在重启SFTP客户端...")
+            
+            # 清理旧SFTP客户端
+            old_sftp_wrapper = self.resources.get('sftp_client')
+            if old_sftp_wrapper:
+                try:
+                    # 关闭SFTP连接
+                    if old_sftp_wrapper.get('sftp_client'):
+                        old_sftp_wrapper['sftp_client'].close()
+                    # 关闭SSH连接
+                    if old_sftp_wrapper.get('ssh_client'):
+                        old_sftp_wrapper['ssh_client'].close()
+                    self.logger.info("旧SFTP连接已关闭")
+                except Exception as e:
+                    self.logger.warning(f"关闭旧SFTP连接时出现异常: {e}")
+                
+                # 从资源中移除
+                self.resources.pop('sftp_client', None)
+            
+            # 重新初始化SFTP客户端（单次尝试）
+            if self.initialize_sftp_client():
+                if self.monitor and 'sftp_client' in self.monitor.components:
+                    self.monitor.components['sftp_client'] = self.resources['sftp_client']
+                self.logger.info("SFTP客户端重启成功")
+                return True
+            else:
+                self.logger.error("SFTP客户端重启失败")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"SFTP客户端重启异常: {e}")
+            return False
+    
+    def upload_file_to_sftp(self, local_file_path: str, remote_filename: str = None) -> bool:
+        """
+        通过SFTP上传文件到服务器
+        
+        Args:
+            local_file_path: 本地文件路径
+            remote_filename: 远程文件名（可选，默认使用本地文件名）
+            
+        Returns:
+            bool: 上传是否成功
+        """
+        try:
+            sftp_wrapper = self.get_sftp_client()
+            if not sftp_wrapper or not sftp_wrapper.get('connected', False):
+                self.logger.error("SFTP客户端未连接或不可用")
+                return False
+            
+            sftp_client = sftp_wrapper.get('sftp_client')
+            if not sftp_client:
+                self.logger.error("SFTP客户端实例不存在")
+                return False
+            
+            # 检查本地文件是否存在
+            if not os.path.exists(local_file_path):
+                self.logger.error(f"本地文件不存在: {local_file_path}")
+                return False
+            
+            # 生成远程文件名
+            if not remote_filename:
+                remote_filename = os.path.basename(local_file_path)
+            
+            # 构建完整的远程路径
+            remote_path = sftp_wrapper.get('remote_path', '/uploads')
+            remote_full_path = f"{remote_path.rstrip('/')}/{remote_filename}"
+            
+            # 标准化远程路径
+            remote_full_path = remote_full_path.replace('\\', '/')
+            
+            self.logger.info(f"正在上传文件: {local_file_path} -> {remote_full_path}")
+            
+            # 执行文件上传
+            sftp_client.put(local_file_path, remote_full_path)
+            
+            # 验证上传是否成功
+            try:
+                remote_stat = sftp_client.stat(remote_full_path)
+                local_size = os.path.getsize(local_file_path)
+                
+                if remote_stat.st_size == local_size:
+                    self.logger.info(f"文件上传成功: {remote_filename} ({local_size} bytes)")
+                    return True
+                else:
+                    self.logger.error(f"文件上传验证失败: 大小不匹配 (本地: {local_size}, 远程: {remote_stat.st_size})")
+                    return False
+                    
+            except Exception as verify_error:
+                self.logger.warning(f"无法验证上传结果: {verify_error}，但上传操作已完成")
+                return True  # 假设上传成功
+                
+        except Exception as e:
+            self.logger.error(f"SFTP文件上传失败: {e}")
+            return False
+    
+    def upload_image_with_timestamp(self, image_data, image_format: str = "jpg", prefix: str = "detection") -> bool:
+        """
+        上传带时间戳的图像到SFTP服务器
+        
+        Args:
+            image_data: 图像数据 (numpy array 或 PIL Image)
+            image_format: 图像格式 (jpg, png)
+            prefix: 文件名前缀
+            
+        Returns:
+            bool: 上传是否成功
+        """
+        try:
+            import tempfile
+            from datetime import datetime
+            
+            # 生成带时间戳的文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # 毫秒精度
+            filename = f"{prefix}_{timestamp}.{image_format}"
+            
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(suffix=f".{image_format}", delete=False) as temp_file:
+                temp_path = temp_file.name
+                
+                # 保存图像到临时文件
+                try:
+                    import cv2
+                    if hasattr(image_data, 'shape'):  # numpy array
+                        cv2.imwrite(temp_path, image_data)
+                    else:
+                        self.logger.error("不支持的图像数据格式")
+                        return False
+                        
+                except ImportError:
+                    try:
+                        from PIL import Image
+                        if hasattr(image_data, 'shape'):  # numpy array
+                            import numpy as np
+                            if len(image_data.shape) == 3:
+                                # 转换BGR到RGB（如果是OpenCV格式）
+                                image_rgb = cv2.cvtColor(image_data, cv2.COLOR_BGR2RGB) if 'cv2' in locals() else image_data
+                                pil_image = Image.fromarray(image_rgb)
+                            else:
+                                pil_image = Image.fromarray(image_data)
+                            pil_image.save(temp_path)
+                        else:
+                            self.logger.error("不支持的图像数据格式")
+                            return False
+                    except ImportError:
+                        self.logger.error("需要安装OpenCV或PIL库来处理图像")
+                        return False
+                
+                # 上传文件
+                success = self.upload_file_to_sftp(temp_path, filename)
+                
+                # 清理临时文件
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+                
+                return success
+                
+        except Exception as e:
+            self.logger.error(f"上传图像失败: {e}")
+            return False
+
     def get_resource(self, name: str) -> Optional[Any]:
         """获取指定的资源"""
         return self.resources.get(name)
-    
-    # === 类型化资源获取方法 - 提供更好的IDE智能提示 ===
     
     def get_mqtt_client(self) -> Optional['MqttClient']:
         """
@@ -1051,6 +1623,15 @@ class SystemInitializer:
             检测器实例或None (类型取决于具体的检测器实现)
         """
         return self.resources.get('detector')
+    
+    def get_sftp_client(self) -> Optional[Dict[str, Any]]:
+        """
+        获取SFTP客户端
+        
+        Returns:
+            SFTP客户端字典或None，包含sftp_client, ssh_client等信息
+        """
+        return self.resources.get('sftp_client')
     
     def get_config_manager(self) -> Optional['ConfigManager']:
         """
@@ -1091,15 +1672,13 @@ class SystemInitializer:
             mqtt_client = self.get_mqtt_client()
             if mqtt_client and mqtt_client.is_connected:
                 notification = {
-                    "type": "component_failure",
                     "component": component_name,
                     "error": error_message,
                     "timestamp": time.time(),
-                    "retry_suggested": False  # 其他组件不建议重试
                 }
                 
                 # 发布到系统错误主题
-                success = mqtt_client.publish("sickvision/system/error", notification)
+                success = mqtt_client.publish("PI/robot/error", notification)
                 if success:
                     if self.logger:
                         self.logger.info(f"已通过MQTT通知组件失败: {component_name}")
@@ -1204,7 +1783,7 @@ class SystemInitializer:
             self.logger.info("正在清理系统资源...")
         
         # 清理TCP服务器
-        tcp_server = self.resources.get('tcp_server')
+        tcp_server = self.resources.get('detectionServer')
         if tcp_server:
             try:
                 tcp_server.stop()
@@ -1257,6 +1836,26 @@ class SystemInitializer:
                 if self.logger:
                     detector_type = type(detector).__name__ if detector else "Unknown"
                     self.logger.error(f"{detector_type}检测器释放失败: {e}")
+        
+        # 清理SFTP客户端
+        sftp_wrapper = self.resources.get('sftp_client')
+        if sftp_wrapper:
+            try:
+                # 关闭SFTP连接
+                if sftp_wrapper.get('sftp_client'):
+                    sftp_wrapper['sftp_client'].close()
+                    if self.logger:
+                        self.logger.info("SFTP客户端已关闭")
+                
+                # 关闭SSH连接
+                if sftp_wrapper.get('ssh_client'):
+                    sftp_wrapper['ssh_client'].close()
+                    if self.logger:
+                        self.logger.info("SSH客户端已关闭")
+                        
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"SFTP客户端关闭失败: {e}")
         
         # 清理MQTT客户端
         mqtt_client = self.resources.get('mqtt_client')
