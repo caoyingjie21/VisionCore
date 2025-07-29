@@ -1,11 +1,31 @@
+board_mode:
+  enabled: true
+  infinite_retry: true
+  monitoring:
+    check_interval: 30
+    failure_threshold: 2
+  retry_delay: 5
 camera:
   connection:
-    ip: 192.168.1.101
+    ip: 192.168.2.10
     port: 2122
     protocol: Cola2
     timeout: 10
   enabled: false
   type: SICK
+detectionServer:
+  buffer_size: 4096
+  connection_timeout: 300
+  enabled: true
+  heartbeat_interval: 30
+  host: 127.0.0.1
+  keep_alive: true
+  max_connections: 15
+  message:
+    encoding: utf-8
+    max_size: 1048576
+  port: 8888
+  socket_timeout: 5
 logging:
   console:
     enabled: true
@@ -30,6 +50,8 @@ logging:
     name: API
   - level: INFO
     name: TcpServer
+model:
+  selectedModel: seasoning.pt
 mqtt:
   connection:
     broker_host: localhost
@@ -61,22 +83,19 @@ mqtt:
       control_stop: sickvision/control/stop
       detection_trigger: sickvision/detection/trigger
       system_command: sickvision/system/command
+roi:
+  centerXOffset: 16
+  centerYOffset: 7
+  enable: true
+  height: 100
+  width: 190
+stability:
+  detectionCount: 5
+  isEnabled: true
+  threshold: 1
 system:
   debug: false
   log_level: INFO
   max_workers: 4
   name: SickVision-Headless
   version: 1.0.0
-tcp_server:
-  buffer_size: 4096
-  connection_timeout: 300
-  enabled: true
-  heartbeat_interval: 30
-  host: 0.0.0.0
-  keep_alive: true
-  max_connections: 15
-  message:
-    encoding: utf-8
-    max_size: 1048576
-  port: 9999
-  socket_timeout: 5

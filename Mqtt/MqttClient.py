@@ -72,9 +72,22 @@ class MqttClient:
     def _init_client(self):
         """初始化MQTT客户端"""
         try:
-            # 创建客户端实例
-            client_id = self.connection_config.get("client_id", "sickvision_client")
-            self.client = mqtt.Client(client_id=client_id)
+            # 如果已有客户端，先清理
+            if self.client:
+                try:
+                    self.client.loop_stop()
+                    self.client.disconnect()
+                except:
+                    pass
+                self.client = None
+            
+            # 创建客户端实例，使用唯一的客户端ID
+            base_client_id = self.connection_config.get("client_id", "sickvision_client")
+            import time
+            unique_client_id = f"{base_client_id}_{int(time.time() * 1000) % 100000}"
+            
+            self.client = mqtt.Client(client_id=unique_client_id)
+            self.logger.info(f"创建MQTT客户端，ID: {unique_client_id}")
             
             # 设置认证
             username = self.connection_config.get("username")
@@ -93,6 +106,9 @@ class MqttClient:
             self.client.on_subscribe = self._on_subscribe
             self.client.on_publish = self._on_publish
             
+            # 重置连接状态
+            self.is_connected = False
+            
             self.logger.info("MQTT客户端初始化成功")
             
         except Exception as e:
@@ -107,9 +123,15 @@ class MqttClient:
             连接是否成功
         """
         try:
-            if self.is_connected:
-                self.logger.warning("MQTT客户端已连接")
+            # 如果已经连接，直接返回
+            if self.is_connected and self.client:
+                self.logger.info("MQTT客户端已连接")
                 return True
+            
+            # 如果连接状态不一致，重新初始化客户端
+            if not self.client or self.is_connected != getattr(self.client, '_state', None):
+                self.logger.info("重新初始化MQTT客户端...")
+                self._init_client()
             
             broker_host = self.connection_config.get("broker_host", "localhost")
             broker_port = self.connection_config.get("broker_port", 1883)
@@ -132,7 +154,7 @@ class MqttClient:
             else:
                 error_msg = f"MQTT连接失败: {mqtt.error_string(result)}"
                 self.logger.error(error_msg)
-                raise MqttConnectionError(error_msg)
+                return False
                 
         except Exception as e:
             self.logger.error(f"MQTT连接异常: {e}")
@@ -141,13 +163,40 @@ class MqttClient:
     async def disconnect(self):
         """断开MQTT连接"""
         try:
-            if self.client and self.is_connected:
-                self.client.loop_stop()
-                self.client.disconnect()
+            if self.client:
+                # 先设置连接状态为False，防止其他操作
                 self.is_connected = False
-                self.logger.info("MQTT连接已断开")
+                
+                # 停止网络循环
+                if hasattr(self.client, '_thread') and self.client._thread and self.client._thread.is_alive():
+                    self.client.loop_stop()
+                    # 等待循环线程结束
+                    await asyncio.sleep(0.5)
+                
+                # 断开连接
+                try:
+                    self.client.disconnect()
+                    # 等待断开完成
+                    await asyncio.sleep(0.2)
+                except Exception as e:
+                    self.logger.warning(f"断开MQTT连接时出现异常: {e}")
+                
+                # 清理回调
+                self.client.on_connect = None
+                self.client.on_disconnect = None
+                self.client.on_message = None
+                self.client.on_subscribe = None
+                self.client.on_publish = None
+                
+                self.logger.info("MQTT连接已断开并清理完成")
+            else:
+                self.logger.debug("MQTT客户端未初始化，无需断开")
+                
         except Exception as e:
             self.logger.error(f"MQTT断开连接失败: {e}")
+        finally:
+            # 确保状态被重置
+            self.is_connected = False
     
     async def _wait_for_connection(self, timeout: int = 10):
         """等待连接建立"""
@@ -157,6 +206,30 @@ class MqttClient:
             await asyncio.sleep(0.1)
         
         raise MqttConnectionError("连接超时")
+    
+    async def force_reinit(self):
+        """强制重新初始化MQTT客户端（用于解决连接冲突）"""
+        try:
+            self.logger.info("强制重新初始化MQTT客户端...")
+            
+            # 完全断开并清理
+            await self.disconnect()
+            
+            # 额外等待，确保资源完全释放
+            await asyncio.sleep(1.0)
+            
+            # 清除所有回调
+            self._message_callbacks.clear()
+            self._general_callback = None
+            
+            # 重新初始化
+            self._init_client()
+            
+            self.logger.info("MQTT客户端强制重新初始化完成")
+            
+        except Exception as e:
+            self.logger.error(f"强制重新初始化MQTT客户端失败: {e}")
+            raise
     
     def subscribe(self, topic: str, qos: Optional[int] = None, callback: Optional[Callable[[MqttMessage], None]] = None) -> bool:
         """
@@ -330,10 +403,29 @@ class MqttClient:
     
     def _on_disconnect(self, client, userdata, rc):
         """断开连接回调"""
+        was_connected = self.is_connected
         self.is_connected = False
+        
         if rc != 0:
-            self.logger.warning(f"MQTT意外断开连接，返回码: {rc}")
+            # 意外断开连接
+            if was_connected:
+                self.logger.warning(f"MQTT意外断开连接，返回码: {rc}")
+                # 记录错误码含义
+                error_meanings = {
+                    1: "连接被拒绝 - 协议版本不正确",
+                    2: "连接被拒绝 - 客户端标识符被拒绝", 
+                    3: "连接被拒绝 - 服务器不可用",
+                    4: "连接被拒绝 - 用户名或密码错误",
+                    5: "连接被拒绝 - 未授权",
+                    7: "连接被拒绝 - 网络错误或客户端ID冲突"
+                }
+                if rc in error_meanings:
+                    self.logger.warning(f"错误详情: {error_meanings[rc]}")
+            else:
+                # 如果之前就没连接成功，可能是重复的断开事件
+                self.logger.debug(f"MQTT断开连接事件(重复): {rc}")
         else:
+            # 正常断开连接
             self.logger.info("MQTT正常断开连接")
     
     def _on_message(self, client, userdata, msg):

@@ -19,6 +19,7 @@ from Managers.LogManager import LogManager
 from Mqtt.MqttClient import MqttClient
 from TcpServer.TcpServer import TcpServer
 from .SystemMonitor import SystemMonitor
+from utils.decorators import handle_keyboard_interrupt, interruptible_retry
 
 
 class SystemInitializer:
@@ -36,8 +37,20 @@ class SystemInitializer:
         self.logger: Optional[logging.Logger] = None
         self.resources: Dict[str, Any] = {}
         self.monitor: Optional[SystemMonitor] = None
-        self.max_restart_attempts = 3
+        
+        # 板端程序配置 - 默认值，稍后从配置文件读取
+        self.board_mode = True  # 默认启用板端模式
+        self.infinite_retry = True  # 默认启用无限重试
+        self.retry_delay = 5  # 固定重试延迟（秒）
+        self.monitoring_check_interval = 30  # 监控检查间隔
+        self.monitoring_failure_threshold = 2  # 失败阈值
+        
+        # 重启相关配置
+        self.max_restart_attempts = float('inf')  # 默认无限重启
         self.restart_count = 0
+        
+        # 存储MQTT消息回调函数，用于重启时恢复
+        self._mqtt_message_callback = None
     
     def initialize_config(self) -> bool:
         """初始化配置管理器"""
@@ -45,10 +58,39 @@ class SystemInitializer:
             print("正在加载配置文件...")
             self.config_mgr = ConfigManager(self.config_path)
             print("配置文件加载成功")
+            
+            # 读取板端模式配置
+            self._load_board_mode_config()
+            
             return True
         except Exception as e:
             print(f"配置文件加载失败: {e}")
             return False
+    
+    def _load_board_mode_config(self):
+        """从配置文件加载板端模式配置"""
+        if not self.config_mgr:
+            return
+            
+        try:
+            board_config = self.config_mgr.get_config("board_mode")
+            if board_config:
+                self.board_mode = board_config.get("enabled", True)
+                self.infinite_retry = board_config.get("infinite_retry", True)
+                self.retry_delay = board_config.get("retry_delay", 5)
+                
+                # 读取监控配置
+                monitoring_config = board_config.get("monitoring", {})
+                self.monitoring_check_interval = monitoring_config.get("check_interval", 30)
+                self.monitoring_failure_threshold = monitoring_config.get("failure_threshold", 2)
+            
+            # 更新重启配置
+            self.max_restart_attempts = float('inf') if (self.board_mode and self.infinite_retry) else 3
+            
+            print(f"板端模式配置: enabled={self.board_mode}, infinite_retry={self.infinite_retry}, retry_delay={self.retry_delay}s")
+            
+        except Exception as e:
+            print(f"加载板端模式配置失败: {e}，使用默认配置")
     
     def initialize_logging(self) -> bool:
         """
@@ -129,12 +171,13 @@ class SystemInitializer:
             self.resources['log_manager'] = log_manager
             return True
     
-    def initialize_mqtt_client(self, max_retries: int = 5) -> bool:
+    @interruptible_retry(max_retries=None, log_prefix="初始化MQTT客户端")
+    def initialize_mqtt_client(self, max_retries: int = None) -> bool:
         """
-        初始化MQTT客户端并连接到broker（支持重试）
+        初始化MQTT客户端并连接到broker（支持无限重试）
         
         Args:
-            max_retries: 最大重试次数
+            max_retries: 最大重试次数，None表示使用系统配置
             
         Returns:
             bool: 初始化是否成功
@@ -148,43 +191,58 @@ class SystemInitializer:
             self.logger.info("MQTT功能已禁用")
             return True  # 禁用时也认为是成功的
         
-        for attempt in range(max_retries):
-            try:
-                self.logger.info(f"正在初始化MQTT客户端... (尝试 {attempt + 1}/{max_retries})")
-                mqtt_client = MqttClient(mqtt_config)
-                
-                # 连接到MQTT broker
-                self.logger.info("正在连接MQTT broker...")
+        try:
+            # 检查是否有旧的MQTT客户端需要清理
+            old_mqtt = self.resources.get('mqtt_client')
+            if old_mqtt:
+                self.logger.info("发现旧的MQTT客户端，正在清理...")
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 try:
+                    loop.run_until_complete(old_mqtt.force_reinit())
+                finally:
+                    loop.close()
+                # 移除旧客户端
+                self.resources.pop('mqtt_client', None)
+            
+            mqtt_client = MqttClient(mqtt_config)
+            
+            # 连接到MQTT broker
+            self.logger.info("正在连接MQTT broker...")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                connected = loop.run_until_complete(mqtt_client.connect())
+                if connected:
+                    self.logger.info("MQTT客户端连接成功")
+                    self.resources['mqtt_client'] = mqtt_client
+                    return True
+                else:
+                    # 连接失败，尝试强制重新初始化
+                    self.logger.warning("MQTT连接失败，尝试强制重新初始化...")
+                    loop.run_until_complete(mqtt_client.force_reinit())
                     connected = loop.run_until_complete(mqtt_client.connect())
                     if connected:
-                        self.logger.info("MQTT客户端连接成功")
+                        self.logger.info("MQTT客户端重新初始化后连接成功")
                         self.resources['mqtt_client'] = mqtt_client
                         return True
                     else:
-                        self.logger.error(f"MQTT客户端连接失败 (尝试 {attempt + 1}/{max_retries})")
-                finally:
-                    loop.close()
-                
-            except Exception as e:
-                self.logger.error(f"MQTT客户端初始化失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2  # 递增等待时间
-                    self.logger.info(f"等待 {wait_time} 秒后重试...")
-                    time.sleep(wait_time)
-                else:
-                    self.logger.error("MQTT客户端初始化最终失败")
+                        return False
+            finally:
+                loop.close()
+        
+        except Exception as e:
+            self.logger.error(f"MQTT客户端初始化异常: {e}")
+            return False
         
         return False
     
-    def initialize_camera(self, max_retries: int = 5) -> bool:
+    def initialize_camera(self, max_retries: int = None) -> bool:
         """
-        初始化相机（支持重试）
+        初始化相机（不使用重试，失败时通过MQTT通知）
         
         Args:
-            max_retries: 最大重试次数
+            max_retries: 最大重试次数（忽略，相机不重试）
             
         Returns:
             bool: 初始化是否成功
@@ -203,46 +261,83 @@ class SystemInitializer:
         ip_address = connection_config.get("ip", "192.168.1.100")
         port = connection_config.get("port", 2122)
         
-        for attempt in range(max_retries):
-            try:
-                self.logger.info(f"正在初始化SICK相机: {ip_address}:{port} (尝试 {attempt + 1}/{max_retries})")
-                
-                # 初始化相机实例
-                from SickVision.SickSDK import QtVisionSick
-                camera = QtVisionSick(
-                    ipAddr=ip_address,
-                    port=port,
-                    protocol="Cola2"
-                )
-                
-                # 尝试连接相机
-                self.logger.info("正在连接相机...")
-                success = camera.connect()
-                
-                if success:
-                    self.logger.info(f"相机连接成功: {ip_address}:{port}")
-                    self.resources['camera'] = camera
-                    return True
-                else:
-                    self.logger.error(f"相机连接失败 (尝试 {attempt + 1}/{max_retries})")
-                    
-            except Exception as e:
-                self.logger.error(f"相机初始化异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+        try:
+            # 初始化相机实例
+            from SickVision.SickSDK import QtVisionSick
+            camera = QtVisionSick(
+                ipAddr=ip_address,
+                port=port,
+                protocol="Cola2"
+            )
             
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 3  # 递增等待时间
-                self.logger.info(f"等待 {wait_time} 秒后重试...")
-                time.sleep(wait_time)
-        
-        self.logger.error("相机初始化最终失败")
-        return False
+            # 尝试连接相机（快速超时，避免阻塞）
+            self.logger.info(f"正在连接相机: {ip_address}:{port}...")
+            
+            # 使用简单的daemon线程进行快速超时
+            import threading
+            import time
+            
+            result = {"success": False, "error": None}
+            
+            def connect_thread():
+                try:
+                    result["success"] = camera.connect()
+                except Exception as e:
+                    result["error"] = str(e)
+            
+            # 创建daemon线程，超时后自动终止
+            thread = threading.Thread(target=connect_thread, daemon=True)
+            start_time = time.time()
+            thread.start()
+            
+            # 轮询检查，每0.1秒检查一次，最多3秒
+            timeout_seconds = 3.0
+            while thread.is_alive() and (time.time() - start_time) < timeout_seconds:
+                time.sleep(0.1)
+            
+            if thread.is_alive():
+                # 超时了
+                self.logger.error(f"相机连接超时: {ip_address}:{port} (3秒)")
+                success = False
+            elif result["error"]:
+                # 有异常
+                self.logger.error(f"相机连接异常: {result['error']}")
+                success = False
+            else:
+                # 正常完成
+                success = result["success"]
+            
+            if success:
+                self.logger.info(f"相机连接成功: {ip_address}:{port}")
+                self.resources['camera'] = camera
+                return True
+            else:
+                error_msg = f"相机连接失败: {ip_address}:{port}"
+                self.logger.error(error_msg)
+                self._notify_component_failure("camera", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"相机初始化异常: {str(e)}"
+            self.logger.error(error_msg)
+            self._notify_component_failure("camera", error_msg)
+            return False
     
-    def initialize_detector(self, max_retries: int = 3) -> bool:
+    def _wait_for_model_file(self, model_path: str) -> bool:
+        """等待模型文件出现"""
+        while not os.path.exists(model_path):
+            self.logger.warning(f"等待模型文件: {model_path}, 30秒后再次检查...")
+            # 使用可中断的睡眠，每秒检查一次中断
+            for _ in range(30):
+                time.sleep(1)
+        self.logger.info(f"模型文件已找到: {model_path}")
+        return True
+    
+    def initialize_detector(self, max_retries: int = None) -> bool:
         """
-        初始化检测器模型（根据平台自动选择模型）
+        初始化检测器模型（不使用重试，失败时通过MQTT通知）
         
         Args:
-            max_retries: 最大重试次数
+            max_retries: 最大重试次数（忽略，检测器不重试）
             
         Returns:
             bool: 初始化是否成功
@@ -250,50 +345,67 @@ class SystemInitializer:
         if not self.logger:
             return False
         
-        # 根据平台自动选择模型文件
-        model_path = self._get_model_path()
-        
-        if not model_path or not os.path.exists(model_path):
-            self.logger.error(f"模型文件不存在: {model_path}")
-            return False
-        
-        for attempt in range(max_retries):
-            try:
-                self.logger.info(f"正在初始化检测器: {model_path} (尝试 {attempt + 1}/{max_retries})")
-                
-                # 根据模型类型选择检测器
-                detector = self._create_detector(model_path)
-                
-                if detector:
+        try:
+            # 根据平台自动选择模型文件
+            model_path = self._get_model_path()
+            
+            if not model_path or not os.path.exists(model_path):
+                error_msg = f"模型文件不存在: {model_path}"
+                self.logger.error(error_msg)
+                self._notify_component_failure("detector", error_msg)
+                return False
+            
+            # 使用快速超时避免长时间阻塞
+            import concurrent.futures
+            
+            def create_and_warmup_detector():
+                try:
+                    # 根据模型类型选择检测器
+                    detector = self._create_detector(model_path)
+                    if not detector:
+                        return None
+                    
                     # 预热模型
                     self.logger.info("正在预热模型...")
-                    if self._warmup_model(detector):
-                        self.logger.info("检测器初始化和预热成功")
-                        self.resources['detector'] = detector
-                        return True
-                    else:
-                        self.logger.warning("模型预热失败，但检测器仍可使用")
-                        self.resources['detector'] = detector
-                        return True
-                else:
-                    self.logger.error(f"检测器创建失败 (尝试 {attempt + 1}/{max_retries})")
-                
-            except Exception as e:
-                self.logger.error(f"检测器初始化失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2
-                    self.logger.info(f"等待 {wait_time} 秒后重试...")
-                    time.sleep(wait_time)
-        
-        self.logger.error("检测器初始化最终失败")
-        return False
+                    warmup_success = self._warmup_model(detector)
+                    return detector if warmup_success else detector  # 即使预热失败也返回检测器
+                except Exception as e:
+                    self.logger.debug(f"检测器创建异常: {e}")
+                    return None
+            
+            # 使用10秒超时（模型加载可能需要更长时间）
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(create_and_warmup_detector)
+                try:
+                    detector = future.result(timeout=10.0)  # 10秒超时
+                except concurrent.futures.TimeoutError:
+                    self.logger.error("检测器初始化超时")
+                    detector = None
+                except Exception as e:
+                    self.logger.error(f"检测器初始化执行异常: {e}")
+                    detector = None
+            
+            if detector:
+                self.logger.info("检测器初始化成功")
+                self.resources['detector'] = detector
+                return True
+            else:
+                error_msg = "检测器初始化失败"
+                self.logger.error(error_msg)
+                self._notify_component_failure("detector", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"检测器初始化异常: {str(e)}"
+            self.logger.error(error_msg)
+            self._notify_component_failure("detector", error_msg)
+            return False
     
-    def initialize_tcp_server(self, max_retries: int = 3) -> bool:
+    def initialize_tcp_server(self, max_retries: int = None) -> bool:
         """
-        初始化TCP服务器
+        初始化TCP服务器（不使用重试，失败时通过MQTT通知）
         
         Args:
-            max_retries: 最大重试次数
+            max_retries: 最大重试次数（忽略，TCP服务器不重试）
             
         Returns:
             bool: 初始化是否成功
@@ -301,37 +413,55 @@ class SystemInitializer:
         if not self.config_mgr or not self.logger:
             return False
             
-        tcp_config = self.config_mgr.get_config("tcp_server")
+        tcp_config = self.config_mgr.get_config("detectionServer")
         
         if not tcp_config or not tcp_config.get("enabled", False):
             self.logger.info("TCP服务器功能已禁用")
             return True  # 禁用时也认为是成功的
         
-        for attempt in range(max_retries):
-            try:
-                self.logger.info(f"正在初始化TCP服务器... (尝试 {attempt + 1}/{max_retries})")
-                
-                # 创建TCP服务器实例（不设置回调，留给main.py处理）
-                tcp_server = TcpServer(tcp_config, self.logger)
-                
-                # 启动TCP服务器
-                if tcp_server.start():
-                    self.logger.info("TCP服务器启动成功")
-                    self.resources['tcp_server'] = tcp_server
-                    return True
-                else:
-                    self.logger.error(f"TCP服务器启动失败 (尝试 {attempt + 1}/{max_retries})")
-                
-            except Exception as e:
-                self.logger.error(f"TCP服务器初始化失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 2  # 递增等待时间
-                    self.logger.info(f"等待 {wait_time} 秒后重试...")
-                    time.sleep(wait_time)
-                else:
-                    self.logger.error("TCP服务器初始化最终失败")
-        
-        return False
+        try:
+            # 创建TCP服务器实例（不设置回调，留给main.py处理）
+            tcp_server = TcpServer(tcp_config, self.logger)
+            
+            # 启动TCP服务器（快速超时，避免阻塞）
+            self.logger.info("正在启动TCP服务器...")
+            
+            # 使用线程池执行器进行非阻塞启动，设置短超时
+            import concurrent.futures
+            
+            def start_with_timeout():
+                try:
+                    return tcp_server.start()
+                except Exception as e:
+                    self.logger.debug(f"TCP服务器启动异常: {e}")
+                    return False
+            
+            # 使用2秒超时
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(start_with_timeout)
+                try:
+                    success = future.result(timeout=2.0)  # 2秒超时
+                except concurrent.futures.TimeoutError:
+                    self.logger.error("TCP服务器启动超时")
+                    success = False
+                except Exception as e:
+                    self.logger.error(f"TCP服务器启动执行异常: {e}")
+                    success = False
+            
+            if success:
+                self.logger.info("TCP服务器启动成功")
+                self.resources['detectionServer'] = tcp_server
+                return True
+            else:
+                error_msg = "TCP服务器启动失败"
+                self.logger.error(error_msg)
+                self._notify_component_failure("tcp_server", error_msg)
+                return False
+        except Exception as e:
+            error_msg = f"TCP服务器初始化异常: {str(e)}"
+            self.logger.error(error_msg)
+            self._notify_component_failure("tcp_server", error_msg)
+            return False
     
     def create_tcp_message_handler(self, catch_handler: Optional[Callable] = None):
         """
@@ -742,8 +872,10 @@ class SystemInitializer:
         """设置系统监控"""
         if not self.logger:
             return
-            
-        self.monitor = SystemMonitor(self.logger, check_interval=30)
+        
+        # 传递板端模式参数
+        self.monitor = SystemMonitor(self.logger, check_interval=self.monitoring_check_interval, 
+                                   failure_threshold=self.monitoring_failure_threshold, board_mode=self.board_mode)
         
         # 注册组件和重启回调
         if self.resources.get('camera'):
@@ -774,7 +906,7 @@ class SystemInitializer:
         self.monitor.start_monitoring()
     
     def _restart_camera(self) -> bool:
-        """重启相机"""
+        """重启相机（单次尝试，失败时通过MQTT通知）"""
         try:
             self.logger.info("正在重启相机...")
             
@@ -786,8 +918,8 @@ class SystemInitializer:
                 except:
                     pass
             
-            # 重新初始化相机
-            if self.initialize_camera(max_retries=3):
+            # 重新初始化相机（单次尝试）
+            if self.initialize_camera():
                 if self.monitor and 'camera' in self.monitor.components:
                     self.monitor.components['camera'] = self.resources['camera']
                 self.logger.info("相机重启成功")
@@ -801,7 +933,7 @@ class SystemInitializer:
             return False
     
     def _restart_mqtt(self) -> bool:
-        """重启MQTT客户端"""
+        """重启MQTT客户端（板端模式支持无限重试）"""
         try:
             self.logger.info("正在重启MQTT客户端...")
             
@@ -809,19 +941,36 @@ class SystemInitializer:
             old_mqtt = self.resources.get('mqtt_client')
             if old_mqtt:
                 try:
+                    self.logger.info("正在断开旧的MQTT连接...")
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     try:
                         loop.run_until_complete(old_mqtt.disconnect())
+                        # 额外等待，确保完全断开
+                        loop.run_until_complete(asyncio.sleep(1.0))
                     finally:
                         loop.close()
-                except:
-                    pass
+                except Exception as e:
+                    self.logger.warning(f"断开旧MQTT连接时出现异常: {e}")
+                
+                # 从资源中移除
+                self.resources.pop('mqtt_client', None)
             
-            # 重新初始化并连接MQTT客户端
-            if self.initialize_mqtt_client(max_retries=3):
+            # 等待一段时间，确保网络资源释放（可中断）
+            import time
+            for _ in range(2):
+                time.sleep(1)
+            
+            # 重新初始化并连接MQTT客户端（板端模式使用无限重试）
+            max_retries = None if self.board_mode else 3
+            if self.initialize_mqtt_client(max_retries=max_retries):
                 mqtt_client = self.resources.get('mqtt_client')
                 if mqtt_client and mqtt_client.is_connected:
+                    # 重新设置应用程序级别的消息回调
+                    if self._mqtt_message_callback:
+                        mqtt_client.set_general_callback(self._mqtt_message_callback)
+                        self.logger.info("MQTT消息回调已重新设置")
+                    
                     if self.monitor and 'mqtt_client' in self.monitor.components:
                         self.monitor.components['mqtt_client'] = mqtt_client
                     self.logger.info("MQTT客户端重启成功")
@@ -835,22 +984,22 @@ class SystemInitializer:
             return False
     
     def _restart_tcp_server(self) -> bool:
-        """重启TCP服务器"""
+        """重启TCP服务器（单次尝试，失败时通过MQTT通知）"""
         try:
             self.logger.info("正在重启TCP服务器...")
             
             # 清理旧TCP服务器
-            old_tcp_server = self.resources.get('tcp_server')
+            old_tcp_server = self.resources.get('detectionServer')
             if old_tcp_server:
                 try:
                     old_tcp_server.stop()
                 except:
                     pass
             
-            # 重新初始化TCP服务器
-            if self.initialize_tcp_server(max_retries=3):
+            # 重新初始化TCP服务器（单次尝试）
+            if self.initialize_tcp_server():
                 if self.monitor and 'tcp_server' in self.monitor.components:
-                    self.monitor.components['tcp_server'] = self.resources['tcp_server']
+                    self.monitor.components['tcp_server'] = self.resources['detectionServer']
                 self.logger.info("TCP服务器重启成功")
                 return True
             else:
@@ -883,7 +1032,7 @@ class SystemInitializer:
         Returns:
             TcpServer实例或None
         """
-        return self.resources.get('tcp_server')
+        return self.resources.get('detectionServer')
     
     def get_camera(self) -> Optional[Any]:
         """
@@ -930,44 +1079,120 @@ class SystemInitializer:
         """
         return self.monitor
     
+    def _notify_component_failure(self, component_name: str, error_message: str):
+        """
+        通过MQTT通知客户端组件初始化失败
+        
+        Args:
+            component_name: 组件名称
+            error_message: 错误消息
+        """
+        try:
+            mqtt_client = self.get_mqtt_client()
+            if mqtt_client and mqtt_client.is_connected:
+                notification = {
+                    "type": "component_failure",
+                    "component": component_name,
+                    "error": error_message,
+                    "timestamp": time.time(),
+                    "retry_suggested": False  # 其他组件不建议重试
+                }
+                
+                # 发布到系统错误主题
+                success = mqtt_client.publish("sickvision/system/error", notification)
+                if success:
+                    if self.logger:
+                        self.logger.info(f"已通过MQTT通知组件失败: {component_name}")
+                else:
+                    if self.logger:
+                        self.logger.warning(f"MQTT通知发送失败: {component_name}")
+            else:
+                if self.logger:
+                    self.logger.warning(f"MQTT未连接，无法通知组件失败: {component_name}")
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"发送组件失败通知时出错: {e}")
+    
+    def set_mqtt_message_callback(self, callback: Callable):
+        """
+        设置MQTT消息回调函数并存储以供重启时恢复
+        
+        Args:
+            callback: MQTT消息回调函数
+        """
+        self._mqtt_message_callback = callback
+        mqtt_client = self.get_mqtt_client()
+        if mqtt_client:
+            mqtt_client.set_general_callback(callback)
+            if self.logger:
+                self.logger.info("MQTT消息回调已设置")
+    
     def get_system_status(self) -> Dict[str, Any]:
         """获取系统状态"""
         if self.monitor:
             return self.monitor.get_system_status()
         return {"monitoring": False, "components": {}}
     
+    @handle_keyboard_interrupt(exit_on_interrupt=True, log_message="停止系统重启")
     def restart_system(self):
-        """重启整个系统"""
+        """重启整个系统（板端模式支持无限重启）"""
         self.restart_count += 1
-        if self.restart_count > self.max_restart_attempts:
+        
+        if self.max_restart_attempts != float('inf') and self.restart_count > self.max_restart_attempts:
             if self.logger:
                 self.logger.error("系统重启次数过多，程序退出")
             else:
                 print("系统重启次数过多，程序退出")
             sys.exit(1)
         
-        if self.logger:
-            self.logger.warning(f"正在重启系统 (第 {self.restart_count} 次)...")
+        if self.board_mode and self.max_restart_attempts == float('inf'):
+            if self.logger:
+                self.logger.warning(f"正在重启系统 (第 {self.restart_count} 次) - 板端模式，无限重试...")
+            else:
+                print(f"正在重启系统 (第 {self.restart_count} 次) - 板端模式，无限重试...")
         else:
-            print(f"正在重启系统 (第 {self.restart_count} 次)...")
+            if self.logger:
+                self.logger.warning(f"正在重启系统 (第 {self.restart_count} 次)...")
+            else:
+                print(f"正在重启系统 (第 {self.restart_count} 次)...")
         
         # 清理资源
         self.cleanup()
         
-        # 等待一段时间
-        time.sleep(5)
+        # 计算重启延迟
+        if self.board_mode:
+            # 板端模式：使用固定重启延迟（可中断）
+            restart_delay = self.retry_delay
+            if self.logger:
+                self.logger.info(f"等待 {restart_delay} 秒后重启系统...")
+            # 使用可中断的睡眠
+            for _ in range(int(restart_delay)):
+                time.sleep(1)
+        else:
+            # 原有逻辑（可中断）
+            for _ in range(5):
+                time.sleep(1)
         
         # 重新初始化
         if self.initialize_config() and self.initialize_all_components():
             if self.logger:
                 self.logger.info("系统重启成功")
-            self.restart_count = 0  # 重置重启计数
+            if not self.board_mode:
+                self.restart_count = 0  # 非板端模式重置重启计数
         else:
             if self.logger:
                 self.logger.error("系统重启失败")
             else:
                 print("系统重启失败")
-            sys.exit(1)
+            
+            if not self.board_mode:
+                sys.exit(1)
+            else:
+                # 板端模式继续重试
+                if self.logger:
+                    self.logger.warning("板端模式：系统重启失败，将继续尝试...")
+                # 递归调用自己继续重启
+                self.restart_system()
     
     def cleanup(self):
         """清理所有资源"""

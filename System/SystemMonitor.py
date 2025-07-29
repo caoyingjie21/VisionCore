@@ -13,26 +13,38 @@ from typing import Dict, Any, Optional, Callable
 from datetime import datetime
 
 from .ComponentStatus import ComponentStatus
+from utils.decorators import handle_keyboard_interrupt
 
 
 class SystemMonitor:
     """系统监控器，负责健康检查和自动重启"""
     
-    def __init__(self, logger: logging.Logger, check_interval: int = 30):
+    def __init__(self, logger: logging.Logger, check_interval: int = 30, failure_threshold: int = None, board_mode: bool = True):
         """
         初始化系统监控器
         
         Args:
             logger: 日志记录器
             check_interval: 健康检查间隔（秒）
+            failure_threshold: 失败阈值，None时使用默认值
+            board_mode: 板端模式，启用更积极的重启策略
         """
         self.logger = logger
         self.check_interval = check_interval
+        self.board_mode = board_mode
         self.components: Dict[str, Any] = {}
         self.status: Dict[str, ComponentStatus] = {}
         self.monitoring = False
         self.monitor_thread: Optional[threading.Thread] = None
         self.restart_callbacks: Dict[str, callable] = {}
+        
+        # 板端模式配置
+        if self.board_mode:
+            self.failure_threshold = failure_threshold if failure_threshold is not None else 2  # 连续2次失败就重启（更积极）
+            self.max_component_restart_attempts = float('inf')  # 组件无限重试
+        else:
+            self.failure_threshold = failure_threshold if failure_threshold is not None else 3  # 原有的3次失败阈值
+            self.max_component_restart_attempts = 5  # 组件重试5次
         
     def register_component(self, name: str, component: Any, restart_callback: Optional[Callable] = None):
         """
@@ -89,6 +101,7 @@ class SystemMonitor:
             self.monitor_thread.join(timeout=5)
         self.logger.info("系统监控已停止")
     
+    @handle_keyboard_interrupt(return_value=None, log_message="监控线程正在停止")
     def _monitor_loop(self):
         """监控循环"""
         while self.monitoring:
@@ -114,10 +127,14 @@ class SystemMonitor:
                 else:
                     status.is_healthy = False
                     status.error_count += 1
-                    self.logger.warning(f"组件 {name} 健康检查失败，错误次数: {status.error_count}")
                     
-                    # 连续3次失败则尝试重启
-                    if status.error_count >= 3:
+                    if self.board_mode:
+                        self.logger.warning(f"组件 {name} 健康检查失败，错误次数: {status.error_count} (板端模式: {self.failure_threshold}次后重启)")
+                    else:
+                        self.logger.warning(f"组件 {name} 健康检查失败，错误次数: {status.error_count}")
+                    
+                    # 达到失败阈值则尝试重启
+                    if status.error_count >= self.failure_threshold:
                         self._restart_component(name)
                 
                 status.last_check = datetime.now()
@@ -160,31 +177,48 @@ class SystemMonitor:
     
     def _restart_component(self, name: str):
         """
-        重启指定组件
+        重启指定组件（板端模式支持无限重试）
         
         Args:
             name: 组件名称
         """
         try:
-            self.logger.warning(f"正在重启组件: {name}")
+            status = self.status[name]
+            
+            if self.board_mode:
+                self.logger.warning(f"正在重启组件: {name} (板端模式，无限重试)")
+            else:
+                self.logger.warning(f"正在重启组件: {name}")
             
             if name in self.restart_callbacks:
                 # 使用自定义重启回调
                 success = self.restart_callbacks[name]()
                 if success:
                     self.logger.info(f"组件 {name} 重启成功")
-                    self.status[name].error_count = 0
-                    self.status[name].last_error = None
+                    status.error_count = 0
+                    status.last_error = None
+                    status.is_healthy = True
                 else:
                     self.logger.error(f"组件 {name} 重启失败")
-                    self.status[name].last_error = "重启失败"
+                    status.last_error = "重启失败"
+                    
+                    if self.board_mode:
+                        # 板端模式：重启失败后不放弃，继续监控和重试
+                        self.logger.warning(f"板端模式：组件 {name} 重启失败，将在下次检查周期继续尝试")
+                        # 不重置错误计数，让下次检查继续尝试重启
+                    else:
+                        # 非板端模式：按原有逻辑处理
+                        pass
             else:
                 self.logger.warning(f"组件 {name} 没有重启回调函数")
-                self.status[name].last_error = "无重启回调"
+                status.last_error = "无重启回调"
                 
         except Exception as e:
             self.logger.error(f"重启组件 {name} 时出错: {e}")
             self.status[name].last_error = f"重启异常: {e}"
+            
+            if self.board_mode:
+                self.logger.warning(f"板端模式：组件 {name} 重启异常，将在下次检查周期继续尝试")
     
     def get_component_status(self, name: str) -> Optional[ComponentStatus]:
         """

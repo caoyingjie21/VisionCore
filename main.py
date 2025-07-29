@@ -2,16 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-VisionCore 主程序入口
-支持自动重启和永久运行模式，适合在开发板上长期运行
+VisionCore 主程序
+负责启动和管理整个视觉系统
 """
 
-import sys
 import time
+import sys
 import signal
 import os
-from System.SystemInitializer import SystemInitializer
 from typing import Dict, Any
+
+from System.SystemInitializer import SystemInitializer
+from utils.decorators import handle_keyboard_interrupt
 
 
 class VisionCoreApp:
@@ -28,54 +30,59 @@ class VisionCoreApp:
         self.initializer = None
         self.running = True
         self.restart_on_failure = True
-        
-        # 设置信号处理
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-    
-    def _signal_handler(self, signum, frame):
-        """信号处理器"""
-        print(f"\n接收到信号 {signum}，正在优雅关闭...")
-        self.running = False
-        self.restart_on_failure = False
     
     def start(self):
         """启动应用程序主循环"""
         print("启动 VisionCore 系统...")
         
-        while self.running:
-            try:
-                # 初始化系统
-                if not self._initialize_system():
-                    if self.restart_on_failure:
-                        print("系统初始化失败，5秒后重试...")
-                        time.sleep(5)
-                        continue
+        try:
+            while self.running:
+                try:
+                    # 初始化系统
+                    if not self._initialize_system():
+                        if self.restart_on_failure:
+                            print("系统初始化失败，5秒后重试...")
+                            # 使用可中断的睡眠
+                            for _ in range(5):
+                                time.sleep(1)
+                            continue
+                        else:
+                            break
+                    
+                    # 运行主循环
+                    self._run_main_loop()
+                    
+                except KeyboardInterrupt:
+                    print("\n接收到停止信号，正在优雅关闭...")
+                    self.running = False
+                    self.restart_on_failure = False
+                    break
+                except Exception as e:
+                    if self.initializer and self.initializer.logger:
+                        self.initializer.logger.error(f"系统运行异常: {e}", exc_info=True)
+                    else:
+                        print(f"系统运行异常: {e}")
+                    
+                    if self.restart_on_failure and self.running:
+                        if self.initializer and self.initializer.logger:
+                            self.initializer.logger.warning("系统将在10秒后自动重启...")
+                        else:
+                            print("系统将在10秒后自动重启...")
+                        # 使用可中断的睡眠
+                        for _ in range(10):
+                            time.sleep(1)
                     else:
                         break
-                
-                # 运行主循环
-                self._run_main_loop()
-                
-            except Exception as e:
-                if self.initializer and self.initializer.logger:
-                    self.initializer.logger.error(f"系统运行异常: {e}", exc_info=True)
-                else:
-                    print(f"系统运行异常: {e}")
-                
-                if self.restart_on_failure and self.running:
-                    if self.initializer and self.initializer.logger:
-                        self.initializer.logger.warning("系统将在10秒后自动重启...")
-                    else:
-                        print("系统将在10秒后自动重启...")
-                    time.sleep(10)
-                else:
-                    break
-            finally:
-                # 清理资源
-                if self.initializer:
-                    self.initializer.cleanup()
-                    self.initializer = None
+                finally:
+                    # 清理资源
+                    if self.initializer:
+                        self.initializer.cleanup()
+                        self.initializer = None
+        
+        except KeyboardInterrupt:
+            print("\n接收到停止信号，正在优雅关闭...")
+            self.running = False
+            self.restart_on_failure = False
         
         print("VisionCore 系统已关闭")
     
@@ -99,6 +106,10 @@ class VisionCoreApp:
             print(f"系统初始化异常: {e}")
             return False
     
+    def _stop_running(self):
+        """停止主循环的清理方法"""
+        self.running = False
+    
     def _run_main_loop(self):
         """运行主程序循环"""
         logger = self.initializer.logger
@@ -114,34 +125,34 @@ class VisionCoreApp:
         
         # 为MQTT客户端设置消息处理回调
         if mqtt_client:
-            mqtt_client.set_general_callback(self.handle_mqtt_message)
+            self.initializer.set_mqtt_message_callback(self.handle_mqtt_message)
             logger.info("MQTT消息处理器已设置")
         
         logger.info("系统运行中，按Ctrl+C停止...")
         
         # 主程序循环
         loop_count = 0
-        while self.running:
-            try:
-                # 检查系统健康状态（每60秒）
-                if loop_count % 60 == 0:
-                    self._check_system_health(logger)
-                
-                time.sleep(1)
-                loop_count += 1
-                
-                # 防止计数器溢出
-                if loop_count > 86400:  # 24小时重置
-                    loop_count = 0
-                
-            except KeyboardInterrupt:
-                logger.info("接收到停止信号")
-                self.running = False
-                break
-            except Exception as e:
-                logger.error(f"主循环异常: {e}", exc_info=True)
-                # 继续运行，不退出主循环
-                time.sleep(1)
+        try:
+            while self.running:
+                try:
+                    # 检查系统健康状态（每60秒）
+                    if loop_count % 60 == 0:
+                        self._check_system_health(logger)
+                    
+                    time.sleep(1)
+                    loop_count += 1
+                    
+                    # 防止计数器溢出
+                    if loop_count > 86400:  # 24小时重置
+                        loop_count = 0
+                    
+                except Exception as e:
+                    logger.error(f"主循环异常: {e}", exc_info=True)
+                    # 继续运行，不退出主循环
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("接收到停止信号，主程序循环停止")
+            self.running = False
     
     def handle_catch(self, client_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -292,9 +303,8 @@ class VisionCoreApp:
                 self._send_config_response(False, error_msg)
                 return
             
-            # 获取更新类型
-            update_type = payload.get("type", "partial")  # partial: 部分更新, full: 完整更新
-            config_data = payload.get("config", {})
+            # 获取更新类型 # partial: 部分更新, full: 完整更新
+            config_data = payload
             restart_required = payload.get("restart_required", False)
             
             if not config_data:
@@ -303,7 +313,7 @@ class VisionCoreApp:
                 self._send_config_response(False, error_msg)
                 return
             
-            logger.info(f"开始更新配置，类型: {update_type}")
+            logger.info(f"开始更新配置")
             
             # 备份当前配置
             backup_success = self._backup_config()
@@ -314,7 +324,7 @@ class VisionCoreApp:
                 return
             
             # 更新配置文件
-            update_success = self._update_config_file(config_data, update_type)
+            update_success = self._update_config_file(config_data)
             if not update_success:
                 error_msg = "配置文件更新失败"
                 logger.error(error_msg)
@@ -347,33 +357,75 @@ class VisionCoreApp:
             self._send_config_response(False, f"配置更新失败: {str(e)}")
     
     def _backup_config(self) -> bool:
-        """备份当前配置文件"""
+        """备份当前配置文件（最多保留10个备份）"""
         try:
             import shutil
             import os
+            import glob
             from datetime import datetime
             
             config_path = self.config_path
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             backup_path = f"{config_path}.backup_{timestamp}"
             
+            # 创建备份
             shutil.copy2(config_path, backup_path)
             
             # 保存最新备份路径
             self.latest_backup = backup_path
             
             self.initializer.logger.info(f"配置文件已备份到: {backup_path}")
+            
+            # 清理旧备份文件，只保留最新的10个
+            self._cleanup_old_backups(config_path, max_backups=10)
+            
             return True
             
         except Exception as e:
             self.initializer.logger.error(f"配置备份失败: {e}")
             return False
     
+    def _cleanup_old_backups(self, config_path: str, max_backups: int = 10):
+        """清理旧的备份文件，只保留最新的指定数量"""
+        try:
+            import glob
+            import os
+            
+            # 查找所有备份文件
+            backup_pattern = f"{config_path}.backup_*"
+            backup_files = glob.glob(backup_pattern)
+            
+            if len(backup_files) <= max_backups:
+                return  # 备份文件数量未超过限制
+            
+            # 按文件修改时间排序（最新的在前）
+            backup_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            
+            # 删除超出数量限制的旧备份文件
+            files_to_delete = backup_files[max_backups:]
+            deleted_count = 0
+            
+            for old_backup in files_to_delete:
+                try:
+                    os.remove(old_backup)
+                    deleted_count += 1
+                    self.initializer.logger.debug(f"已删除旧备份文件: {old_backup}")
+                except Exception as e:
+                    self.initializer.logger.warning(f"删除备份文件失败: {old_backup}, 错误: {e}")
+            
+            if deleted_count > 0:
+                remaining_count = len(backup_files) - deleted_count
+                self.initializer.logger.info(f"已清理 {deleted_count} 个旧备份文件，当前保留 {remaining_count} 个备份")
+                
+        except Exception as e:
+            self.initializer.logger.error(f"清理备份文件时出错: {e}")
+    
     def _restore_config_backup(self) -> bool:
         """恢复配置备份"""
         try:
+            import os
+            import shutil
             if hasattr(self, 'latest_backup') and os.path.exists(self.latest_backup):
-                import shutil
                 shutil.copy2(self.latest_backup, self.config_path)
                 self.initializer.logger.info("配置文件已从备份恢复")
                 return True
@@ -382,7 +434,7 @@ class VisionCoreApp:
             self.initializer.logger.error(f"配置恢复失败: {e}")
             return False
     
-    def _update_config_file(self, config_data: dict, update_type: str) -> bool:
+    def _update_config_file(self, config_data: dict) -> bool:
         """
         更新配置文件
         
@@ -392,18 +444,13 @@ class VisionCoreApp:
         """
         try:
             import yaml
+            # 部分更新配置
+            # 读取当前配置
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                current_config = yaml.safe_load(f) or {}
             
-            if update_type == "full":
-                # 完整替换配置
-                new_config = config_data
-            else:
-                # 部分更新配置
-                # 读取当前配置
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    current_config = yaml.safe_load(f) or {}
-                
-                # 深度合并配置
-                new_config = self._deep_merge_dict(current_config, config_data)
+            # 深度合并配置
+            new_config = self._deep_merge_dict(current_config, config_data)
             
             # 写入新配置
             with open(self.config_path, 'w', encoding='utf-8') as f:
@@ -417,13 +464,24 @@ class VisionCoreApp:
             return False
     
     def _deep_merge_dict(self, base: dict, update: dict) -> dict:
-        """深度合并字典"""
+        """深度合并字典（忽略大小写）"""
         result = base.copy()
         
+        # 创建基础字典的小写键映射
+        base_lower_keys = {k.lower(): k for k in base.keys()}
+        
         for key, value in update.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                result[key] = self._deep_merge_dict(result[key], value)
+            # 查找匹配的键（忽略大小写）
+            matching_key = base_lower_keys.get(key.lower(), key)
+            
+            if matching_key in result and isinstance(result[matching_key], dict) and isinstance(value, dict):
+                # 递归合并字典
+                result[matching_key] = self._deep_merge_dict(result[matching_key], value)
             else:
+                # 如果找到了大小写不同的匹配键，使用原始键名
+                if matching_key != key and matching_key in result:
+                    # 删除旧键，使用新键
+                    del result[matching_key]
                 result[key] = value
         
         return result
@@ -449,7 +507,7 @@ class VisionCoreApp:
             total_components = 0
             
             # 根据配置变化决定需要重启的组件
-            if "tcp_server" in config_data:
+            if "detectionServer" in config_data:
                 total_components += 1
                 if self._reload_tcp_server():
                     success_count += 1
@@ -516,10 +574,7 @@ class VisionCoreApp:
         """重启MQTT客户端以应用新配置"""
         try:
             if self.initializer._restart_mqtt():
-                # 重新设置回调
-                mqtt_client = self.initializer.get_mqtt_client()
-                if mqtt_client:
-                    mqtt_client.set_general_callback(self.handle_mqtt_message)
+                # 消息回调会自动恢复，无需手动设置
                 return True
             return False
         except Exception:
@@ -578,18 +633,6 @@ class VisionCoreApp:
             if command == "restart":
                 logger.info("收到系统重启命令")
                 self._restart_system()
-                
-            elif command == "get_status":
-                # 获取系统状态
-                status = self.initializer.get_system_status()
-                mqtt_client = self.initializer.get_mqtt_client()
-                if mqtt_client:
-                    response = {
-                        "command": "get_status",
-                        "status": status,
-                        "timestamp": time.time()
-                    }
-                    mqtt_client.publish("sickvision/system/status", response)
                     
             elif command == "get_config":
                 # 获取当前配置
@@ -605,7 +648,7 @@ class VisionCoreApp:
                             "config": current_config,
                             "timestamp": time.time()
                         }
-                        mqtt_client.publish("sickvision/system/config", response)
+                        mqtt_client.publish("PI/robot/config", response)
                         
                 except Exception as e:
                     logger.error(f"获取配置失败: {e}")
