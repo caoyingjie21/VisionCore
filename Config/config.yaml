@@ -18,7 +18,7 @@ detectionServer:
   connection_timeout: 300
   enabled: true
   heartbeat_interval: 30
-  host: 127.0.0.8
+  host: 127.0.0.1
   keep_alive: true
   max_connections: 15
   message:
@@ -55,20 +55,6 @@ model:
   - obb_seasoning256.float.rknn
   - seasoning256.pt
   selectedModel: seasoning256.pt
-sftp:
-  enabled: false
-  host: 192.168.10.5
-  port: 22
-  username: qt
-  password: 123456
-  remote_path: /
-  connection:
-    timeout: 15
-    retry_attempts: 3
-  upload:
-    verify_checksum: true
-    overwrite_existing: true
-    create_directories: true
 mqtt:
   connection:
     broker_host: localhost
@@ -88,17 +74,8 @@ mqtt:
     subscribe: 2
   topics:
     publish:
-      config_reload_response: sickvision/config/reload/response
-      control_status: sickvision/control/status
-      detection_result: sickvision/detection/result
-      system_error: sickvision/system/error
-      system_heartbeat: sickvision/system/heartbeat
-      system_status: sickvision/system/status
+      message: PI/robot/message
     subscribe:
-      config_update: sickvision/config/update
-      control_start: sickvision/control/start
-      control_stop: sickvision/control/stop
-      detection_trigger: sickvision/detection/trigger
       system_command: sickvision/system/command
 roi:
   centerXOffset: 16
@@ -106,6 +83,20 @@ roi:
   enable: true
   height: 199
   width: 190
+sftp:
+  connection:
+    retry_attempts: 3
+    timeout: 15
+  enabled: false
+  host: 192.168.10.5
+  password: '123456'
+  port: 22
+  remote_path: /
+  upload:
+    create_directories: true
+    overwrite_existing: true
+    verify_checksum: true
+  username: qt
 stability:
   detectionCount: 5
   isEnabled: true

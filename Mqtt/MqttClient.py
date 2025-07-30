@@ -20,6 +20,15 @@ except ImportError:
     MQTT_AVAILABLE = False
     print("Warning: paho-mqtt not available, MQTT功能已禁用")
 
+# 导入MQTTResponse和VisionCoreCommands
+try:
+    from ClassModel.MqttResponse import MQTTResponse
+    from SystemEnums.VisionCoreCommands import VisionCoreCommands, MessageType
+    MQTT_RESPONSE_AVAILABLE = True
+except ImportError:
+    MQTT_RESPONSE_AVAILABLE = False
+    print("Warning: MQTTResponse not available, response methods will be disabled")
+
 
 @dataclass
 class MqttMessage:
@@ -28,7 +37,7 @@ class MqttMessage:
     payload: Any
     qos: int
     retain: bool
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
 
 
 class MqttConnectionError(Exception):
@@ -325,19 +334,62 @@ class MqttClient:
             if retain is None:
                 retain = self.message_config.get("retain", False)
             
-            # 处理消息内容
+            # 处理消息内容 - 确保payload是字符串或字节类型
+            original_payload = payload
             if isinstance(payload, (dict, list)):
-                payload = json.dumps(payload, ensure_ascii=False)
+                try:
+                    payload = json.dumps(payload, ensure_ascii=False, default=str)
+                except (TypeError, ValueError) as e:
+                    self.logger.error(f"JSON序列化失败: {e}")
+                    # 使用更安全的字符串转换
+                    try:
+                        payload = json.dumps(str(payload), ensure_ascii=False)
+                    except:
+                        payload = "{}"
             elif not isinstance(payload, (str, bytes)):
+                payload = str(payload)
+            
+            # 确保payload是字符串类型（paho-mqtt期望字符串或字节）
+            if not isinstance(payload, (str, bytes)):
                 payload = str(payload)
             
             # 检查消息大小
             max_size = self.message_config.get("max_payload_size", 1048576)  # 1MB
-            if len(payload.encode('utf-8')) > max_size:
-                self.logger.error(f"消息大小超过限制: {len(payload)} > {max_size}")
+            
+            # 安全地计算payload大小
+            try:
+                if isinstance(payload, str):
+                    payload_size = len(payload.encode('utf-8'))
+                elif isinstance(payload, bytes):
+                    payload_size = len(payload)
+                else:
+                    payload_size = len(str(payload).encode('utf-8'))
+            except Exception as e:
+                self.logger.error(f"计算消息大小失败: {e}")
+                payload_size = 0
+            
+            if payload_size > max_size:
+                self.logger.error(f"消息大小超过限制: {payload_size} > {max_size}")
                 return False
             
             # 发布消息
+            # 确保所有参数都是正确的类型
+            if not isinstance(topic, str):
+                self.logger.error(f"topic必须是字符串类型，当前类型: {type(topic)}")
+                return False
+            
+            if not isinstance(payload, (str, bytes)):
+                self.logger.error(f"payload必须是字符串或字节类型，当前类型: {type(payload)}")
+                return False
+            
+            if not isinstance(qos, int):
+                self.logger.error(f"qos必须是整数类型，当前类型: {type(qos)}")
+                return False
+            
+            if not isinstance(retain, bool):
+                self.logger.error(f"retain必须是布尔类型，当前类型: {type(retain)}")
+                return False
+            
             result = self.client.publish(topic, payload, qos, retain)
             
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
@@ -348,7 +400,7 @@ class MqttClient:
                 return False
                 
         except Exception as e:
-            self.logger.error(f"消息发布异常: {e}")
+            self.logger.error(f"消息发布异常: {e}, payload类型: {type(payload)}, payload值: {payload}")
             return False
     
     def add_topic_callback(self, topic: str, callback: Callable[[MqttMessage], None]):
@@ -538,6 +590,67 @@ class MqttClient:
             "subscribed_topics": list(self._message_callbacks.keys()),
             "timestamp": datetime.now().isoformat()
         }
+    
+    def get_mqtt_publish_topic(self) -> str:
+        """
+        获取 MQTT 发布主题
+        
+        Returns:
+            发布主题字符串
+        """
+        try:
+            topics_config = self.topics_config
+            if "publish" in topics_config:
+                publish_config = topics_config["publish"]
+                # 如果publish是字典，获取message字段
+                if isinstance(publish_config, dict):
+                    return publish_config.get("message", "PI/robot/message")
+                # 如果publish是字符串，直接返回
+                elif isinstance(publish_config, str):
+                    return publish_config
+                else:
+                    self.logger.warning(f"MQTT publish配置格式错误: {publish_config}")
+                    return "PI/robot/message"
+            return "PI/robot/message"  # 默认主题
+        except Exception as e:
+            self.logger.warning(f"获取 MQTT 发布主题失败，使用默认主题: {e}")
+            return "PI/robot/message"
+    
+    def send_mqtt_response(self, response: 'MQTTResponse') -> bool:
+        """
+        统一发送 MQTT 响应
+        
+        Args:
+            response: MQTT响应对象
+            
+        Returns:
+            bool: 发送是否成功
+        """
+        if not MQTT_RESPONSE_AVAILABLE:
+            self.logger.error("MQTTResponse不可用，无法发送响应")
+            return False
+            
+        try:
+            if not self.is_connected:
+                self.logger.warning("MQTT 客户端未连接，无法发送响应")
+                return False
+            
+            # 获取发布主题
+            topic = self.get_mqtt_publish_topic()
+            # 直接传递字典，让 MQTT 客户端自己处理 JSON 序列化
+            payload = response.to_dict()
+            success = self.publish(topic, payload)
+            
+            if success:
+                self.logger.debug(f"MQTT 响应已发送到主题: {topic}")
+                return True
+            else:
+                self.logger.warning(f"MQTT 响应发送失败: {topic}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"发送 MQTT 响应失败: {e}")
+            return False
 
 
 # 便捷函数

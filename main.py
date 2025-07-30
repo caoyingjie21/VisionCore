@@ -11,9 +11,13 @@ import sys
 import signal
 import os
 from typing import Dict, Any
+import json
 
 from System.SystemInitializer import SystemInitializer
+from ClassModel.MqttResponse import MQTTResponse
 from utils.decorators import handle_keyboard_interrupt
+# 直接导入所有命令常量
+from SystemEnums.VisionCoreCommands import MessageType, VisionCoreCommands
 
 
 class VisionCoreApp:
@@ -274,11 +278,13 @@ class VisionCoreApp:
             
             logger.info(f"收到MQTT消息: {topic}")
             logger.debug(f"消息内容: {payload}")
+
             
-            # 根据主题处理不同的消息
-            if topic == "sickvision/config/update":
-                self._handle_mqtt_config_update(payload)
-            elif topic == "sickvision/system/command":
+            
+            # # 根据主题处理不同的消息
+            # if topic == "sickvision/config/update":
+            #     self._handle_mqtt_config_update(payload)
+            if topic == "sickvision/system/command":
                 self._handle_mqtt_system_command(payload)
             else:
                 logger.debug(f"未处理的MQTT主题: {topic}")
@@ -295,6 +301,7 @@ class VisionCoreApp:
         """
         logger = self.initializer.logger
         logger.info(f"收到MQTT系统命令: {payload}")
+        payload = json.loads(payload)
         
         try:
             if not isinstance(payload, dict):
@@ -623,15 +630,16 @@ class VisionCoreApp:
     def _send_config_response(self, success: bool, message: str):
         """发送配置更新响应"""
         try:
+            response = MQTTResponse(
+                command="save_config",
+                component="config_manager",
+                messageType=MessageType.SUCCESS if success else MessageType.ERROR,
+                message=message,
+                data={"success": success}
+            )
             mqtt_client = self.initializer.get_mqtt_client()
             if mqtt_client:
-                response = {
-                    "success": success,
-                    "message": message,
-                    "timestamp": time.time()
-                }
-                mqtt_client.publish("sickvision/config/reload/response", response)
-                
+                mqtt_client.send_mqtt_response(response)
         except Exception as e:
             self.initializer.logger.error(f"发送配置响应失败: {e}")
     
@@ -647,51 +655,518 @@ class VisionCoreApp:
             
             command = payload.get("command")
             
-            if command == "restart":
+            if command == VisionCoreCommands.RESTART:
                 logger.info("收到系统重启命令")
+                response = MQTTResponse(
+                    command=VisionCoreCommands.RESTART.value,
+                    component="system",
+                    messageType=MessageType.SUCCESS,
+                    message="系统重启命令已接收，正在重启...",
+                    data={}
+                )
+                mqtt_client = self.initializer.get_mqtt_client()
+                if mqtt_client:
+                    mqtt_client.send_mqtt_response(response)
                 self._restart_system()
-                    
-            elif command == "get_config":
-                # 获取当前配置
+            
+            # 获取配置
+            elif command == VisionCoreCommands.GET_CONFIG:
                 try:
                     import yaml
                     import os
                     import glob
                     with open(self.config_path, 'r', encoding='utf-8') as f:
                         current_config = yaml.safe_load(f)
-                    
-                    # 添加models键值对，检查Models目录下的RKNN和PT文件
                     models_dir = "./Models"
                     model_files = []
                     if os.path.exists(models_dir):
-                        # 查找.rknn文件
                         rknn_pattern = os.path.join(models_dir, "*.rknn")
                         rknn_paths = glob.glob(rknn_pattern)
-                        
-                        # 查找.pt文件
                         pt_pattern = os.path.join(models_dir, "*.pt")
                         pt_paths = glob.glob(pt_pattern)
-                        
-                        # 合并所有模型文件名
                         all_paths = rknn_paths + pt_paths
                         model_files = [os.path.basename(path) for path in all_paths]
-                    
                     current_config["models"] = model_files
                     
+                    response = MQTTResponse(
+                        command=VisionCoreCommands.GET_CONFIG.value,
+                        component="config_manager",
+                        messageType=MessageType.SUCCESS,
+                        message="配置获取成功",
+                        data=current_config
+                    )
                     mqtt_client = self.initializer.get_mqtt_client()
                     if mqtt_client:
-                        response = {
-                            "command": "get_config",
-                            "config": current_config,
-                            "timestamp": time.time()
-                        }
-                        mqtt_client.publish("PI/robot/config", response)
-                        
+                        mqtt_client.send_mqtt_response(response)
+                    
                 except Exception as e:
                     logger.error(f"获取配置失败: {e}")
+                    response = MQTTResponse(
+                        command=VisionCoreCommands.GET_CONFIG.value,
+                        component="config_manager",
+                        messageType=MessageType.ERROR,
+                        message=f"获取配置失败: {e}",
+                        data={}
+                    )
+                    mqtt_client = self.initializer.get_mqtt_client()
+                    if mqtt_client:
+                        mqtt_client.send_mqtt_response(response)
+            # 保存配置
+            elif command == VisionCoreCommands.SAVE_CONFIG:
+                self._handle_mqtt_config_update(payload.get("Data"))
+            # 获取标定图像
+            elif command == VisionCoreCommands.GET_CALIBRAT_IMAGE:
+                try:
+                    # 获取相机
+                    camera = self.initializer.get_camera()
+                    if not camera:
+                        error_msg = "相机未连接或未初始化"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                            component="camera",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        return
                     
+                    # 获取标定图像
+                    try:
+                        _, _, image, _ = camera.get_fresh_frame()
+                        if image is None:
+                            error_msg = "无法获取标定图像"
+                            logger.error(error_msg)
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                component="camera",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={}
+                            )
+                            mqtt_client = self.initializer.get_mqtt_client()
+                            if mqtt_client:
+                                mqtt_client.send_mqtt_response(response)
+                            return
+                        
+                        success_msg = f"标定图像获取成功，图像尺寸: {image.shape}"
+                        logger.info(success_msg)
+                        
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                            component="camera",
+                            messageType=MessageType.SUCCESS,
+                            message=success_msg,
+                            data={
+                                "image_shape": list(image.shape),
+                                "image_type": str(type(image))
+                            }
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        
+                    except Exception as image_error:
+                        error_msg = f"获取标定图像失败: {image_error}"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                            component="camera",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                    
+                except Exception as e:
+                    error_msg = f"执行标定图像获取命令失败: {e}"
+                    logger.error(error_msg)
+                    response = MQTTResponse(
+                        command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                        component="camera",
+                        messageType=MessageType.ERROR,
+                        message=error_msg,
+                        data={}
+                    )
+                    mqtt_client = self.initializer.get_mqtt_client()
+                    if mqtt_client:
+                        mqtt_client.send_mqtt_response(response)
+            
+            # 相机获取图像
+            elif command == VisionCoreCommands.GET_IMAGE:
+                # 获取相机图像并上传到SFTP
+                logger.info("收到获取图像命令")
+                
+                try:
+                    camera = self.initializer.get_camera()
+                    sftp_client = self.initializer.get_sftp_client()
+                    
+                    # 检查相机是否可用
+                    if not camera:
+                        error_msg = "相机未连接或未初始化"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.GET_IMAGE.value,
+                            component="camera",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        return
+                    
+                    # 检查SFTP是否可用
+                    if not sftp_client or not sftp_client.connected:
+                        error_msg = "SFTP客户端未连接或未初始化"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.GET_IMAGE.value,
+                            component="sftp",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        return
+                    
+                    logger.info("正在获取相机图像...")
+                    
+                    # 获取相机图像
+                    try:
+                        _, _, image, _ = camera.get_fresh_frame()
+                        
+                        if image is None:
+                            error_msg = "无法获取相机图像"
+                            logger.error(error_msg)
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.GET_IMAGE.value,
+                                component="camera",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={}
+                            )
+                            mqtt_client = self.initializer.get_mqtt_client()
+                            if mqtt_client:
+                                mqtt_client.send_mqtt_response(response)
+                            return
+                        
+                        logger.info(f"成功获取相机图像，尺寸: {image.shape}")
+                        
+                        # 使用QtSFTP类的upload_image方法上传图像
+                        logger.info("正在上传图像到SFTP服务器...")
+                        
+                        result = sftp_client.upload_image(
+                            image_data=image,
+                            image_format="jpg",
+                            prefix="calibration",
+                            remote_path="/"  # 上传到根路径
+                        )
+                        
+                        if result["success"]:
+                            success_msg = f"图像上传成功: {result['filename']} ({result['file_size']} bytes) -> 根路径"
+                            logger.info(success_msg)
+                            
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.GET_IMAGE.value,
+                                component="sftp",
+                                messageType=MessageType.SUCCESS,
+                                message=success_msg,
+                                data={
+                                    "filename": result["filename"],
+                                    "remote_path": result["remote_path"],
+                                    "file_size": result["file_size"],
+                                    "image_shape": list(image.shape)
+                                }
+                            )
+                            mqtt_client = self.initializer.get_mqtt_client()
+                            if mqtt_client:
+                                mqtt_client.send_mqtt_response(response)
+                        else:
+                            error_msg = f"图像上传失败: {result['message']}"
+                            logger.error(error_msg)
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.GET_IMAGE.value,
+                                component="sftp",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={}
+                            )
+                            mqtt_client = self.initializer.get_mqtt_client()
+                            if mqtt_client:
+                                mqtt_client.send_mqtt_response(response)
+                        
+                    except Exception as camera_error:
+                        error_msg = f"获取相机图像失败: {camera_error}"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.GET_IMAGE.value,
+                            component="camera",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                
+                except Exception as e:
+                    error_msg = f"执行get_image命令失败: {e}"
+                    logger.error(error_msg)
+                    response = MQTTResponse(
+                        command=VisionCoreCommands.GET_IMAGE.value,
+                        component="camera",
+                        messageType=MessageType.ERROR,
+                        message=error_msg,
+                        data={}
+                    )
+                    mqtt_client = self.initializer.get_mqtt_client()
+                    if mqtt_client:
+                        mqtt_client.send_mqtt_response(response)
+            elif command == VisionCoreCommands.SFTP_TEST:
+                # SFTP测试 - 上传test.png文件
+                logger.info("收到SFTP测试命令")
+                
+                try:
+                    import os
+                    sftp_client = self.initializer.get_sftp_client()
+                    
+                    # 检查SFTP是否可用
+                    if not sftp_client or not sftp_client.connected:
+                        error_msg = "SFTP客户端未连接或未初始化"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.SFTP_TEST.value,
+                            component="sftp",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        return
+                    
+                    # 使用QtSFTP类的test_connection方法
+                    logger.info("正在测试SFTP连接...")
+                    result = sftp_client.test_connection("./test.png")
+                    
+                    # 构建响应
+                    if result["success"]:
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.SFTP_TEST.value,
+                            component="sftp",
+                            messageType=MessageType.SUCCESS,
+                            message=result["message"],
+                            data={
+                                "filename": result["filename"],
+                                "remote_path": result["remote_path"],
+                                "file_size": result["file_size"]
+                            }
+                        )
+                        logger.info(f"SFTP测试成功: {result['message']}")
+                    else:
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.SFTP_TEST.value,
+                            component="sftp",
+                            messageType=MessageType.ERROR,
+                            message=result["message"],
+                            data={}
+                        )
+                        logger.error(f"SFTP测试失败: {result['message']}")
+                    
+                    # 发送响应
+                    mqtt_client = self.initializer.get_mqtt_client()
+                    if mqtt_client:
+                        mqtt_client.send_mqtt_response(response)
+                
+                except Exception as e:
+                    error_msg = f"执行SFTP测试命令失败: {e}"
+                    logger.error(error_msg)
+                    response = MQTTResponse(
+                        command=VisionCoreCommands.SFTP_TEST.value,
+                        component="sftp",
+                        messageType=MessageType.ERROR,
+                        message=error_msg,
+                        data={}
+                    )
+                    mqtt_client = self.initializer.get_mqtt_client()
+                    if mqtt_client:
+                        mqtt_client.send_mqtt_response(response)
+            # 获取系统状态
+            elif command == VisionCoreCommands.GET_SYSTEM_STATUS:
+                try:
+                    # 获取系统状态
+                    system_status = self.initializer.get_system_status()
+                    
+                    response = MQTTResponse(
+                        command=VisionCoreCommands.GET_SYSTEM_STATUS.value,
+                        component="system",
+                        messageType=MessageType.SUCCESS,
+                        message="系统状态获取成功",
+                        data=system_status
+                    )
+                    mqtt_client = self.initializer.get_mqtt_client()
+                    if mqtt_client:
+                        mqtt_client.send_mqtt_response(response)
+                    
+                except Exception as e:
+                    logger.error(f"获取系统状态失败: {e}")
+                    response = MQTTResponse(
+                        command=VisionCoreCommands.GET_SYSTEM_STATUS.value,
+                        component="system",
+                        messageType=MessageType.ERROR,
+                        message=f"获取系统状态失败: {e}",
+                        data={}
+                    )
+                    mqtt_client = self.initializer.get_mqtt_client()
+                    if mqtt_client:
+                        mqtt_client.send_mqtt_response(response)
+            # 模型测试
+            elif command == VisionCoreCommands.MODEL_TEST:
+                try:
+                    # 获取检测器
+                    detector = self.initializer.get_detector()
+                    if not detector:
+                        error_msg = "检测器未初始化"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.MODEL_TEST.value,
+                            component="detector",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        return
+                    
+                    # 获取相机
+                    camera = self.initializer.get_camera()
+                    if not camera:
+                        error_msg = "相机未连接或未初始化"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.MODEL_TEST.value,
+                            component="camera",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        return
+                    
+                    # 获取测试图像
+                    try:
+                        _, _, image, _ = camera.get_fresh_frame()
+                        if image is None:
+                            error_msg = "无法获取测试图像"
+                            logger.error(error_msg)
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.MODEL_TEST.value,
+                                component="camera",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={}
+                            )
+                            mqtt_client = self.initializer.get_mqtt_client()
+                            if mqtt_client:
+                                mqtt_client.send_mqtt_response(response)
+                            return
+                        
+                        # 执行检测
+                        logger.info("正在执行模型测试...")
+                        results = detector.detect(image)
+                        
+                        # 解析结果
+                        detection_count = 0
+                        if hasattr(self.initializer, '_parse_rknn_results'):
+                            detection_count = self.initializer._parse_rknn_results(results)
+                        elif hasattr(self.initializer, '_parse_yolo_results'):
+                            detection_count = self.initializer._parse_yolo_results(results)
+                        else:
+                            # 简单计数
+                            if isinstance(results, (list, tuple)):
+                                detection_count = len(results)
+                            elif hasattr(results, '__len__'):
+                                detection_count = len(results)
+                            else:
+                                detection_count = 1 if results else 0
+                        
+                        success_msg = f"模型测试完成，检测到 {detection_count} 个目标"
+                        logger.info(success_msg)
+                        
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.MODEL_TEST.value,
+                            component="detector",
+                            messageType=MessageType.SUCCESS,
+                            message=success_msg,
+                            data={
+                                "detection_count": detection_count,
+                                "image_shape": list(image.shape),
+                                "model_type": type(detector).__name__
+                            }
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        
+                    except Exception as test_error:
+                        error_msg = f"模型测试执行失败: {test_error}"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.MODEL_TEST.value,
+                            component="detector",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                    
+                except Exception as e:
+                    error_msg = f"执行模型测试命令失败: {e}"
+                    logger.error(error_msg)
+                    response = MQTTResponse(
+                        command=VisionCoreCommands.MODEL_TEST.value,
+                        component="detector",
+                        messageType=MessageType.ERROR,
+                        message=error_msg,
+                        data={}
+                    )
+                    mqtt_client = self.initializer.get_mqtt_client()
+                    if mqtt_client:
+                        mqtt_client.send_mqtt_response(response)
             else:
                 logger.warning(f"未知系统命令: {command}")
+                # 可以添加支持命令的提示
+                supported_commands = VisionCoreCommands.get_all_commands()
+                logger.info(f"支持的命令: {supported_commands}")
+                
+                response = MQTTResponse(
+                    command=command,
+                    component="system",
+                    messageType=MessageType.ERROR,
+                    message=f"未知系统命令: {command}",
+                    data={
+                        "supported_commands": supported_commands
+                    }
+                )
+                mqtt_client = self.initializer.get_mqtt_client()
+                if mqtt_client:
+                    mqtt_client.send_mqtt_response(response)
                 
         except Exception as e:
             logger.error(f"处理系统命令时出错: {e}")

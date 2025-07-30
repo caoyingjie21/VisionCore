@@ -17,7 +17,10 @@ from typing import Tuple, Optional, Any, Dict, Callable
 from Managers.ConfigManager import ConfigManager
 from Managers.LogManager import LogManager
 from Mqtt.MqttClient import MqttClient
+from SickVision.SickSDK import QtVisionSick
 from TcpServer.TcpServer import TcpServer
+from ClassModel.MqttResponse import MQTTResponse
+from SystemEnums.VisionCoreCommands import VisionCoreCommands, MessageType
 from .SystemMonitor import SystemMonitor
 from utils.decorators import handle_keyboard_interrupt, interruptible_retry
 
@@ -430,7 +433,7 @@ class SystemInitializer:
     
     def initialize_sftp_client(self, max_retries: int = None) -> bool:
         """
-        初始化SFTP客户端（不使用重试，失败时通过MQTT通知）
+        初始化SFTP客户端（使用QtSFTP类）
         
         Args:
             max_retries: 最大重试次数（忽略，SFTP客户端不重试）
@@ -448,124 +451,29 @@ class SystemInitializer:
             return True  # 禁用时也认为是成功的
         
         try:
-            # 获取SFTP配置参数
-            host = sftp_config.get("host", "localhost")
-            port = sftp_config.get("port", 22)
-            username = sftp_config.get("username", "anonymous")
-            password = sftp_config.get("password", "")
-            private_key_path = sftp_config.get("private_key_path", None)
-            remote_path = sftp_config.get("remote_path", "/uploads")
+            # 导入QtSFTP类
+            from SFTP.QtSFTP import QtSFTP
             
-            self.logger.info(f"正在连接SFTP服务器: {username}@{host}:{port}")
+            # 设置错误回调函数
+            def sftp_error_callback(component_name: str, error_message: str):
+                self._notify_component_failure(component_name, error_message)
             
-            # 使用快速超时避免长时间阻塞
-            import threading
-            import time
+            # 创建QtSFTP实例
+            sftp_client = QtSFTP(sftp_config, self.logger)
+            sftp_client.set_error_callback(sftp_error_callback)
             
-            result = {"success": False, "error": None, "client": None}
+            # 连接到SFTP服务器
+            self.logger.info(f"正在连接SFTP服务器: {sftp_config.get('host', 'localhost')}:{sftp_config.get('port', 22)}")
             
-            def connect_sftp():
-                try:
-                    import paramiko
-                    
-                    # 创建SSH客户端
-                    ssh_client = paramiko.SSHClient()
-                    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    
-                    # 连接参数
-                    connect_kwargs = {
-                        "hostname": host,
-                        "port": port,
-                        "username": username,
-                        "timeout": 10  # SSH连接超时
-                    }
-                    
-                    # 认证方式：优先使用私钥，其次密码
-                    if private_key_path and os.path.exists(private_key_path):
-                        try:
-                            private_key = paramiko.RSAKey.from_private_key_file(private_key_path)
-                            connect_kwargs["pkey"] = private_key
-                            self.logger.info(f"使用私钥认证: {private_key_path}")
-                        except Exception as key_error:
-                            self.logger.warning(f"私钥加载失败，回退到密码认证: {key_error}")
-                            if password:
-                                connect_kwargs["password"] = password
-                    elif password:
-                        connect_kwargs["password"] = password
-                        self.logger.info("使用密码认证")
-                    else:
-                        raise Exception("未提供有效的认证信息（私钥或密码）")
-                    
-                    # 连接SSH
-                    ssh_client.connect(**connect_kwargs)
-                    
-                    # 创建SFTP客户端
-                    sftp_client = ssh_client.open_sftp()
-                    
-                    # 测试远程路径是否存在，不存在则尝试创建
-                    try:
-                        sftp_client.stat(remote_path)
-                        self.logger.info(f"远程路径已存在: {remote_path}")
-                    except FileNotFoundError:
-                        try:
-                            # 尝试创建目录（递归创建）
-                            self._create_remote_directory(sftp_client, remote_path)
-                            self.logger.info(f"远程路径已创建: {remote_path}")
-                        except Exception as mkdir_error:
-                            self.logger.warning(f"无法创建远程路径: {mkdir_error}")
-                    
-                    # 封装SFTP客户端信息
-                    sftp_wrapper = {
-                        "ssh_client": ssh_client,
-                        "sftp_client": sftp_client,
-                        "host": host,
-                        "port": port,
-                        "username": username,
-                        "remote_path": remote_path,
-                        "connected": True
-                    }
-                    
-                    result["success"] = True
-                    result["client"] = sftp_wrapper
-                    
-                except ImportError:
-                    result["error"] = "paramiko库未安装，请运行: pip install paramiko"
-                except Exception as e:
-                    result["error"] = str(e)
-            
-            # 创建daemon线程，超时后自动终止
-            thread = threading.Thread(target=connect_sftp, daemon=True)
-            start_time = time.time()
-            thread.start()
-            
-            # 轮询检查，每0.1秒检查一次，最多15秒
-            timeout_seconds = 15.0
-            while thread.is_alive() and (time.time() - start_time) < timeout_seconds:
-                time.sleep(0.1)
-            
-            if thread.is_alive():
-                # 超时了
-                error_msg = f"SFTP连接超时: {host}:{port} (15秒)"
-                self.logger.error(error_msg)
-                self._notify_component_failure("sftp", error_msg)
-                return False
-            elif result["error"]:
-                # 有异常
-                error_msg = f"SFTP连接失败: {result['error']}"
-                self.logger.error(error_msg)
-                self._notify_component_failure("sftp", error_msg)
-                return False
+            if sftp_client.connect():
+                self.logger.info("SFTP客户端连接成功")
+                self.resources['sftp_client'] = sftp_client
+                return True
             else:
-                # 正常完成
-                if result["success"] and result["client"]:
-                    self.logger.info(f"SFTP连接成功: {username}@{host}:{port}")
-                    self.resources['sftp_client'] = result["client"]
-                    return True
-                else:
-                    error_msg = f"SFTP连接失败: 未知错误"
-                    self.logger.error(error_msg)
-                    self._notify_component_failure("sftp", error_msg)
-                    return False
+                error_msg = "SFTP客户端连接失败"
+                self.logger.error(error_msg)
+                self._notify_component_failure("sftp", error_msg)
+                return False
                     
         except Exception as e:
             error_msg = f"SFTP客户端初始化异常: {str(e)}"
@@ -573,35 +481,6 @@ class SystemInitializer:
             self._notify_component_failure("sftp", error_msg)
             return False
     
-    def _create_remote_directory(self, sftp_client, remote_path: str):
-        """
-        递归创建远程目录
-        
-        Args:
-            sftp_client: SFTP客户端实例
-            remote_path: 远程路径
-        """
-        try:
-            # 标准化路径（使用正斜杠）
-            remote_path = remote_path.replace('\\', '/')
-            
-            # 分割路径
-            path_parts = remote_path.strip('/').split('/')
-            current_path = '/'
-            
-            for part in path_parts:
-                if part:  # 跳过空部分
-                    current_path = current_path.rstrip('/') + '/' + part
-                    try:
-                        sftp_client.stat(current_path)
-                    except FileNotFoundError:
-                        sftp_client.mkdir(current_path)
-                        self.logger.debug(f"创建远程目录: {current_path}")
-                        
-        except Exception as e:
-            self.logger.error(f"创建远程目录失败: {e}")
-            raise
-
     def initialize_tcp_server(self, max_retries: int = None) -> bool:
         """
         初始化TCP服务器（不使用重试，失败时通过MQTT通知）
@@ -1424,15 +1303,11 @@ class SystemInitializer:
             self.logger.info("正在重启SFTP客户端...")
             
             # 清理旧SFTP客户端
-            old_sftp_wrapper = self.resources.get('sftp_client')
-            if old_sftp_wrapper:
+            old_sftp_client = self.resources.get('sftp_client')
+            if old_sftp_client:
                 try:
-                    # 关闭SFTP连接
-                    if old_sftp_wrapper.get('sftp_client'):
-                        old_sftp_wrapper['sftp_client'].close()
-                    # 关闭SSH连接
-                    if old_sftp_wrapper.get('ssh_client'):
-                        old_sftp_wrapper['ssh_client'].close()
+                    # 使用QtSFTP类的disconnect方法
+                    old_sftp_client.disconnect()
                     self.logger.info("旧SFTP连接已关闭")
                 except Exception as e:
                     self.logger.warning(f"关闭旧SFTP连接时出现异常: {e}")
@@ -1456,7 +1331,7 @@ class SystemInitializer:
     
     def upload_file_to_sftp(self, local_file_path: str, remote_filename: str = None) -> bool:
         """
-        通过SFTP上传文件到服务器
+        通过SFTP上传文件到服务器（使用QtSFTP类）
         
         Args:
             local_file_path: 本地文件路径
@@ -1466,52 +1341,20 @@ class SystemInitializer:
             bool: 上传是否成功
         """
         try:
-            sftp_wrapper = self.get_sftp_client()
-            if not sftp_wrapper or not sftp_wrapper.get('connected', False):
+            sftp_client = self.get_sftp_client()
+            if not sftp_client or not sftp_client.connected:
                 self.logger.error("SFTP客户端未连接或不可用")
                 return False
             
-            sftp_client = sftp_wrapper.get('sftp_client')
-            if not sftp_client:
-                self.logger.error("SFTP客户端实例不存在")
+            # 使用QtSFTP类的upload_file方法
+            result = sftp_client.upload_file(local_file_path, remote_filename)
+            
+            if result["success"]:
+                self.logger.info(result["message"])
+                return True
+            else:
+                self.logger.error(result["message"])
                 return False
-            
-            # 检查本地文件是否存在
-            if not os.path.exists(local_file_path):
-                self.logger.error(f"本地文件不存在: {local_file_path}")
-                return False
-            
-            # 生成远程文件名
-            if not remote_filename:
-                remote_filename = os.path.basename(local_file_path)
-            
-            # 构建完整的远程路径
-            remote_path = sftp_wrapper.get('remote_path', '/uploads')
-            remote_full_path = f"{remote_path.rstrip('/')}/{remote_filename}"
-            
-            # 标准化远程路径
-            remote_full_path = remote_full_path.replace('\\', '/')
-            
-            self.logger.info(f"正在上传文件: {local_file_path} -> {remote_full_path}")
-            
-            # 执行文件上传
-            sftp_client.put(local_file_path, remote_full_path)
-            
-            # 验证上传是否成功
-            try:
-                remote_stat = sftp_client.stat(remote_full_path)
-                local_size = os.path.getsize(local_file_path)
-                
-                if remote_stat.st_size == local_size:
-                    self.logger.info(f"文件上传成功: {remote_filename} ({local_size} bytes)")
-                    return True
-                else:
-                    self.logger.error(f"文件上传验证失败: 大小不匹配 (本地: {local_size}, 远程: {remote_stat.st_size})")
-                    return False
-                    
-            except Exception as verify_error:
-                self.logger.warning(f"无法验证上传结果: {verify_error}，但上传操作已完成")
-                return True  # 假设上传成功
                 
         except Exception as e:
             self.logger.error(f"SFTP文件上传失败: {e}")
@@ -1519,7 +1362,7 @@ class SystemInitializer:
     
     def upload_image_with_timestamp(self, image_data, image_format: str = "jpg", prefix: str = "detection") -> bool:
         """
-        上传带时间戳的图像到SFTP服务器
+        上传带时间戳的图像到SFTP服务器（使用QtSFTP类）
         
         Args:
             image_data: 图像数据 (numpy array 或 PIL Image)
@@ -1530,55 +1373,20 @@ class SystemInitializer:
             bool: 上传是否成功
         """
         try:
-            import tempfile
-            from datetime import datetime
+            sftp_client = self.get_sftp_client()
+            if not sftp_client or not sftp_client.connected:
+                self.logger.error("SFTP客户端未连接或不可用")
+                return False
             
-            # 生成带时间戳的文件名
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # 毫秒精度
-            filename = f"{prefix}_{timestamp}.{image_format}"
+            # 使用QtSFTP类的upload_image方法
+            result = sftp_client.upload_image(image_data, image_format, prefix)
             
-            # 创建临时文件
-            with tempfile.NamedTemporaryFile(suffix=f".{image_format}", delete=False) as temp_file:
-                temp_path = temp_file.name
-                
-                # 保存图像到临时文件
-                try:
-                    import cv2
-                    if hasattr(image_data, 'shape'):  # numpy array
-                        cv2.imwrite(temp_path, image_data)
-                    else:
-                        self.logger.error("不支持的图像数据格式")
-                        return False
-                        
-                except ImportError:
-                    try:
-                        from PIL import Image
-                        if hasattr(image_data, 'shape'):  # numpy array
-                            import numpy as np
-                            if len(image_data.shape) == 3:
-                                # 转换BGR到RGB（如果是OpenCV格式）
-                                image_rgb = cv2.cvtColor(image_data, cv2.COLOR_BGR2RGB) if 'cv2' in locals() else image_data
-                                pil_image = Image.fromarray(image_rgb)
-                            else:
-                                pil_image = Image.fromarray(image_data)
-                            pil_image.save(temp_path)
-                        else:
-                            self.logger.error("不支持的图像数据格式")
-                            return False
-                    except ImportError:
-                        self.logger.error("需要安装OpenCV或PIL库来处理图像")
-                        return False
-                
-                # 上传文件
-                success = self.upload_file_to_sftp(temp_path, filename)
-                
-                # 清理临时文件
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
-                
-                return success
+            if result["success"]:
+                self.logger.info(result["message"])
+                return True
+            else:
+                self.logger.error(result["message"])
+                return False
                 
         except Exception as e:
             self.logger.error(f"上传图像失败: {e}")
@@ -1606,7 +1414,7 @@ class SystemInitializer:
         """
         return self.resources.get('detectionServer')
     
-    def get_camera(self) -> Optional[Any]:
+    def get_camera(self) -> Optional['QtVisionSick']:
         """
         获取相机实例
         
@@ -1624,12 +1432,12 @@ class SystemInitializer:
         """
         return self.resources.get('detector')
     
-    def get_sftp_client(self) -> Optional[Dict[str, Any]]:
+    def get_sftp_client(self) -> Optional['QtSFTP']:
         """
         获取SFTP客户端
         
         Returns:
-            SFTP客户端字典或None，包含sftp_client, ssh_client等信息
+            QtSFTP实例或None
         """
         return self.resources.get('sftp_client')
     
@@ -1671,14 +1479,21 @@ class SystemInitializer:
         try:
             mqtt_client = self.get_mqtt_client()
             if mqtt_client and mqtt_client.is_connected:
-                notification = {
-                    "component": component_name,
-                    "error": error_message,
-                    "timestamp": time.time(),
-                }
+                # 创建MQTTResponse对象
+                response = MQTTResponse(
+                    command=VisionCoreCommands.ERROR_TIP.value,
+                    component=component_name,
+                    messageType=MessageType.ERROR,
+                    message=f"组件 {component_name} 初始化失败: {error_message}",
+                    data={
+                        "component": component_name,
+                        "error": error_message,
+                        "timestamp": time.time()
+                    }
+                )
                 
-                # 发布到系统错误主题
-                success = mqtt_client.publish("PI/robot/error", notification)
+                # 直接使用mqtt_client发送响应
+                success = mqtt_client.send_mqtt_response(response)
                 if success:
                     if self.logger:
                         self.logger.info(f"已通过MQTT通知组件失败: {component_name}")
@@ -1838,20 +1653,13 @@ class SystemInitializer:
                     self.logger.error(f"{detector_type}检测器释放失败: {e}")
         
         # 清理SFTP客户端
-        sftp_wrapper = self.resources.get('sftp_client')
-        if sftp_wrapper:
+        sftp_client = self.resources.get('sftp_client')
+        if sftp_client:
             try:
-                # 关闭SFTP连接
-                if sftp_wrapper.get('sftp_client'):
-                    sftp_wrapper['sftp_client'].close()
-                    if self.logger:
-                        self.logger.info("SFTP客户端已关闭")
-                
-                # 关闭SSH连接
-                if sftp_wrapper.get('ssh_client'):
-                    sftp_wrapper['ssh_client'].close()
-                    if self.logger:
-                        self.logger.info("SSH客户端已关闭")
+                # 使用QtSFTP类的disconnect方法
+                sftp_client.disconnect()
+                if self.logger:
+                    self.logger.info("SFTP客户端已关闭")
                         
             except Exception as e:
                 if self.logger:
