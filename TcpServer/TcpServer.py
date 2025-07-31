@@ -9,7 +9,6 @@ TCP服务器模块
 import socket
 import threading
 import time
-import json
 import logging
 from typing import Dict, List, Optional, Callable, Any
 from dataclasses import dataclass
@@ -187,16 +186,8 @@ class TcpServer:
         client_socket = client_info.socket
         
         try:
-            # 发送欢迎消息
-            welcome_msg = {
-                "type": "welcome",
-                "message": "欢迎连接到VisionCore TCP服务器",
-                "client_id": client_id,
-                "timestamp": time.time()
-            }
-            self._send_message(client_socket, welcome_msg)
-            
             # 处理客户端消息
+            buffer = ""
             while self.is_running and client_info.is_active:
                 try:
                     # 接收消息
@@ -204,41 +195,34 @@ class TcpServer:
                     if not data:
                         break
                     
-                    # 解析消息
-                    try:
-                        message = json.loads(data.decode('utf-8'))
-                        self.stats["messages_received"] += 1
+                    # 解码数据并添加到缓冲区
+                    buffer += data.decode('utf-8')
+                    
+                    # 处理完整的消息（以\r\n或\n结尾）
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
                         
-                        # 更新心跳时间
-                        client_info.last_heartbeat = datetime.now()
-                        
-                        # 调用外部消息处理器
-                        if self.message_callback:
-                            try:
-                                response = self.message_callback(client_id, message)
-                                if response:
-                                    self._send_message(client_socket, response)
-                            except Exception as e:
-                                self.logger.error(f"消息回调处理失败: {e}")
-                                error_response = {
-                                    "type": "error",
-                                    "message": f"消息处理失败: {str(e)}",
-                                    "timestamp": time.time()
-                                }
-                                self._send_message(client_socket, error_response)
-                        else:
-                            # 如果没有设置回调，返回默认响应
-                            default_response = {
-                                "type": "info",
-                                "message": "消息已接收，但未设置处理器",
-                                "timestamp": time.time()
-                            }
-                            self._send_message(client_socket, default_response)
-                        
-                    except json.JSONDecodeError:
-                        self.logger.warning(f"收到无效JSON消息: {client_id}")
-                        error_msg = {"type": "error", "message": "无效的JSON格式", "timestamp": time.time()}
-                        self._send_message(client_socket, error_msg)
+                        if line:
+                            self.stats["messages_received"] += 1
+                            
+                            # 更新心跳时间
+                            client_info.last_heartbeat = datetime.now()
+                            
+                            # 调用外部消息处理器
+                            if self.message_callback:
+                                try:
+                                    response = self.message_callback(client_id, line)
+                                    if response:
+                                        self._send_message(client_socket, response)
+                                except Exception as e:
+                                    self.logger.error(f"消息回调处理失败: {e}")
+                                    error_response = f"消息处理失败: {str(e)}\r\n"
+                                    self._send_message(client_socket, error_response)
+                            else:
+                                # 如果没有设置回调，返回默认响应
+                                default_response = f"消息已接收，但未设置处理器\r\n"
+                                self._send_message(client_socket, default_response)
                 
                 except socket.timeout:
                     continue
@@ -250,42 +234,21 @@ class TcpServer:
         finally:
             self._disconnect_client(client_id, "连接断开")
     
-    def _send_message(self, client_socket: socket.socket, message: Dict[str, Any]) -> bool:
+    def _send_message(self, client_socket: socket.socket, message: str) -> bool:
         """发送消息给客户端"""
         try:
-            # 预处理消息，确保所有datetime对象都转换为字符串
-            processed_message = self._process_message_for_json(message)
-            data = json.dumps(processed_message, ensure_ascii=False, default=self._json_serializer).encode('utf-8')
-            client_socket.send(data)
+            # 确保消息以\r\n结尾
+            if not message.endswith('\r\n'):
+                message += '\r\n'
+            
+            data = message.encode('utf-8')
+            client_socket.sendall(data)
             self.stats["messages_sent"] += 1
             return True
         except Exception as e:
             self.logger.error(f"发送消息失败: {e}")
             self.stats["errors"] += 1
             return False
-    
-    def _process_message_for_json(self, obj):
-        """递归处理消息对象，确保所有内容都能JSON序列化"""
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        elif isinstance(obj, dict):
-            return {key: self._process_message_for_json(value) for key, value in obj.items()}
-        elif isinstance(obj, (list, tuple)):
-            return [self._process_message_for_json(item) for item in obj]
-        elif hasattr(obj, '__dict__'):
-            # 处理自定义对象，转换为字典
-            return self._process_message_for_json(obj.__dict__)
-        else:
-            return obj
-    
-    def _json_serializer(self, obj):
-        """JSON序列化的备用处理器"""
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        elif hasattr(obj, '__dict__'):
-            return obj.__dict__
-        else:
-            return str(obj)
     
     def _disconnect_client(self, client_id: str, reason: str):
         """断开客户端连接"""
@@ -345,14 +308,14 @@ class TcpServer:
                     self.logger.error(f"清理监控出错: {e}")
     
     # 公共方法
-    def broadcast_message(self, message: Dict[str, Any], exclude_client: Optional[str] = None):
+    def broadcast_message(self, message: str, exclude_client: Optional[str] = None):
         """广播消息给所有客户端"""
         with self.thread_lock:
             for client_id, client_info in self.clients.items():
                 if client_id != exclude_client and client_info.is_active:
                     self._send_message(client_info.socket, message)
     
-    def send_to_client(self, client_id: str, message: Dict[str, Any]) -> bool:
+    def send_to_client(self, client_id: str, message: str) -> bool:
         """发送消息给指定客户端"""
         client_info = self.clients.get(client_id)
         if client_info and client_info.is_active:

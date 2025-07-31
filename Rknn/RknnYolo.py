@@ -394,7 +394,22 @@ class RKNN_YOLO:
             box.pt4y = int(box.pt4y / self.input_height * image_h)
 
         return pred_boxes
+
+
+    def detect_and_coordinat_transform_without(self, image, coordinat_transform):
+        """
+        检测后使用坐标变换
         
+        Args:
+            image: 输入图像
+            coordinat_transform: 坐标变换矩阵
+
+        Returns:
+            list: 检测结果列表，每个元素为DetectBox对象
+        """
+        detect_boxes = self.detect(image)
+        return detect_boxes
+
     def release(self):
         """
         释放RKNN资源

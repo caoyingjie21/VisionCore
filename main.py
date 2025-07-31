@@ -158,19 +158,19 @@ class VisionCoreApp:
             logger.info("接收到停止信号，主程序循环停止")
             self.running = False
     
-    def handle_catch(self, client_id: str, message: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_catch(self, client_id: str, message: str):
         """
         处理catch指令
         
         Args:
             client_id: 客户端ID
-            message: 接收到的消息
+            message: 接收到的消息字符串
             
         Returns:
-            Dict: 响应消息
+            str: 响应消息字符串
         """
         logger = self.initializer.logger
-        logger.info(f"收到catch指令来自客户端: {client_id}")
+        logger.info(f"收到catch指令来自客户端: {client_id}, 消息: {message}")
         
         try:
             # 获取系统组件
@@ -181,21 +181,15 @@ class VisionCoreApp:
             # 检查组件是否可用
             if not camera:
                 logger.warning("catch指令执行失败: 相机未初始化或未连接")
-                return {
-                    "type": "catch_response",
-                    "success": False,
-                    "message": "相机未初始化或未连接",
-                    "timestamp": time.time()
-                }
+                # 通过MQTT发送错误通知
+                self.initializer._notify_component_failure("camera", f"相机未初始化或未连接 (客户端: {client_id})")
+                return "0,0.000,0.000,0.000,0.000"
             
             if not detector:
                 logger.warning("catch指令执行失败: 检测器未初始化")
-                return {
-                    "type": "catch_response",
-                    "success": False,
-                    "message": "检测器未初始化",
-                    "timestamp": time.time()
-                }
+                # 通过MQTT发送错误通知
+                self.initializer._notify_component_failure("detector", f"检测器未初始化 (客户端: {client_id})")
+                return "0,0.000,0.000,0.000,0.000"
             
             # 执行实际的catch逻辑
             try:
@@ -212,42 +206,31 @@ class VisionCoreApp:
                         results = detector.detect(image)
                         logger.info(f"检测完成，发现 {len(results)} 个目标")
                         
+                        # 临时返回：检测个数,0.000,0.000,0.000,0.000
+                        # TODO: 这里需要根据实际的检测结果返回正确的坐标数据
+                        return f"{len(results)},0.000,0.000,0.000,0.000"
                        
                     else:
                         logger.error("无法获取相机图像")
-                        return {
-                            "type": "catch_response",
-                            "success": False,
-                            "message": "无法获取相机图像",
-                            "timestamp": time.time()
-                        }
+                        # 通过MQTT发送错误通知
+                        self.initializer._notify_component_failure("camera", f"无法获取相机图像 (客户端: {client_id})")
+                        return "0,0.000,0.000,0.000,0.000"
                 
                 # 临时响应（在实现具体逻辑前）
                 logger.info("catch指令已接收，功能正在开发中")
-                return {
-                    "type": "catch_response",
-                    "success": True,
-                    "message": "catch指令已接收，功能正在开发中",
-                    "timestamp": time.time()
-                }
+                return "0,0.000,0.000,0.000,0.000"
                 
             except Exception as e:
                 logger.error(f"执行catch时出错: {e}")
-                return {
-                    "type": "catch_response",
-                    "success": False,
-                    "message": f"catch执行失败: {str(e)}",
-                    "timestamp": time.time()
-                }
+                # 通过MQTT发送错误通知
+                self.initializer._notify_component_failure("catch_execution", f"catch执行失败: {str(e)} (客户端: {client_id})")
+                return "0,0.000,0.000,0.000,0.000"
                 
         except Exception as e:
             logger.error(f"处理catch指令失败: {e}")
-            return {
-                "type": "catch_response",
-                "success": False,
-                "message": f"catch指令处理失败: {str(e)}",
-                "timestamp": time.time()
-            }
+            # 通过MQTT发送错误通知
+            self.initializer._notify_component_failure("catch_handler", f"catch指令处理失败: {str(e)} (客户端: {client_id})")
+            return "0,0.000,0.000,0.000,0.000"
     
     def handle_mqtt_message(self, mqtt_message):
         """
@@ -1349,13 +1332,9 @@ class VisionCoreApp:
                 # 如果TCP服务器运行正常，向客户端发送系统状态
                 tcp_server = self.initializer.get_tcp_server()
                 if tcp_server and tcp_server.is_connected and len(tcp_server.clients) > 0:
-                    status_msg = {
-                        "type": "system_health_report",
-                        "healthy_components": healthy_components,
-                        "total_components": total_components,
-                        "unhealthy_components": unhealthy,
-                        "timestamp": time.time()
-                    }
+                    status_msg = f"系统健康报告: {healthy_components}/{total_components} 组件正常"
+                    if unhealthy:
+                        status_msg += f", 不健康的组件: {', '.join(unhealthy)}"
                     tcp_server.broadcast_message(status_msg)
                 
         except Exception as e:

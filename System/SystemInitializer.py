@@ -21,6 +21,8 @@ from SickVision.SickSDK import QtVisionSick
 from TcpServer.TcpServer import TcpServer
 from ClassModel.MqttResponse import MQTTResponse
 from SystemEnums.VisionCoreCommands import VisionCoreCommands, MessageType
+from Rknn.RknnYolo import RKNN_YOLO
+from SFTP.QtSFTP import QtSFTP
 from .SystemMonitor import SystemMonitor
 from utils.decorators import handle_keyboard_interrupt, interruptible_retry
 
@@ -554,45 +556,37 @@ class SystemInitializer:
         Returns:
             Callable: 消息处理函数
         """
-        def handle_tcp_message(client_id: str, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        def handle_tcp_message(client_id: str, message: str) -> Optional[str]:
             """
             处理TCP消息的统一入口
             
             Args:
                 client_id: 客户端ID
-                message: 接收到的消息
+                message: 接收到的消息字符串
                 
             Returns:
-                Optional[Dict]: 响应消息，如果为None则不回复
+                Optional[str]: 响应消息字符串，如果为None则不回复
             """
             try:
-                message_type = message.get("type", "unknown")
-                
-                if message_type == "catch":
+                # 检查是否是catch命令
+                if message.lower().strip() == "catch":
                     if catch_handler:
                         return catch_handler(client_id, message)
                     else:
-                        return {
-                            "type": "catch_response",
-                            "success": False,
-                            "message": "catch处理器未设置",
-                            "timestamp": time.time()
-                        }
+                        # 通过MQTT发送错误通知
+                        self._notify_component_failure("tcp_handler", f"catch处理器未设置 (客户端: {client_id})")
+                        return "0,0.000,0.000,0.000,0.000"
                 else:
-                    self.logger.debug(f"未处理的消息类型: {message_type} from {client_id}")
-                    return {
-                        "type": "error",
-                        "message": f"不支持的消息类型: {message_type}",
-                        "timestamp": time.time()
-                    }
+                    self.logger.debug(f"未处理的消息: {message} from {client_id}")
+                    # 通过MQTT发送错误通知
+                    self._notify_component_failure("tcp_handler", f"不支持的消息: {message} (客户端: {client_id})")
+                    return "0,0.000,0.000,0.000,0.000"
                     
             except Exception as e:
                 self.logger.error(f"处理TCP消息时出错: {e}")
-                return {
-                    "type": "error",
-                    "message": f"消息处理失败: {str(e)}",
-                    "timestamp": time.time()
-                }
+                # 通过MQTT发送错误通知
+                self._notify_component_failure("tcp_handler", f"消息处理失败: {str(e)} (客户端: {client_id})")
+                return "0,0.000,0.000,0.000,0.000"
         
         return handle_tcp_message
     
@@ -1423,7 +1417,7 @@ class SystemInitializer:
         """
         return self.resources.get('camera')
     
-    def get_detector(self) -> Optional[Any]:
+    def get_detector(self) -> Optional['RKNN_YOLO']:
         """
         获取检测器实例
         
