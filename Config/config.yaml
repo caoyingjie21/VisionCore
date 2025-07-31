@@ -11,7 +11,7 @@ camera:
     port: 2122
     protocol: Cola2
     timeout: 10
-  enabled: false
+  enabled: true
   type: SICK
 detectionServer:
   buffer_size: 4096
@@ -87,8 +87,8 @@ sftp:
   connection:
     retry_attempts: 3
     timeout: 15
-  enabled: false
-  host: 192.168.10.5
+  enabled: true
+  host: 192.168.2.15
   password: '123456'
   port: 22
   remote_path: /

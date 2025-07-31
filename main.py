@@ -203,38 +203,24 @@ class VisionCoreApp:
                 
                 # TODO: 在这里添加具体的catch实现
                 # 1. 获取相机图像
-                # if hasattr(camera, 'get_fresh_frame'):
-                #     image = camera.get_fresh_frame()
-                #     if image is not None:
-                #         logger.info("成功获取相机图像")
-                #         
-                #         # 2. 进行目标检测
-                #         results = detector.detect(image)
-                #         logger.info(f"检测完成，发现 {len(results)} 个目标")
-                #         
-                #         # 3. 可选：通过MQTT发布结果
-                #         if mqtt_client and hasattr(mqtt_client, 'publish'):
-                #             mqtt_client.publish("sickvision/detection/result", {
-                #                 "client_id": client_id,
-                #                 "results": results,
-                #                 "timestamp": time.time()
-                #             })
-                #         
-                #         return {
-                #             "type": "catch_response",
-                #             "success": True,
-                #             "message": f"catch执行成功，检测到 {len(results)} 个目标",
-                #             "results": results,
-                #             "timestamp": time.time()
-                #         }
-                #     else:
-                #         logger.error("无法获取相机图像")
-                #         return {
-                #             "type": "catch_response",
-                #             "success": False,
-                #             "message": "无法获取相机图像",
-                #             "timestamp": time.time()
-                #         }
+                if hasattr(camera, 'get_fresh_frame'):
+                    image = camera.get_fresh_frame()
+                    if image is not None:
+                        logger.info("成功获取相机图像")
+                        
+                        # 2. 进行目标检测
+                        results = detector.detect(image)
+                        logger.info(f"检测完成，发现 {len(results)} 个目标")
+                        
+                       
+                    else:
+                        logger.error("无法获取相机图像")
+                        return {
+                            "type": "catch_response",
+                            "success": False,
+                            "message": "无法获取相机图像",
+                            "timestamp": time.time()
+                        }
                 
                 # 临时响应（在实现具体逻辑前）
                 logger.info("catch指令已接收，功能正在开发中")
@@ -668,7 +654,6 @@ class VisionCoreApp:
                 if mqtt_client:
                     mqtt_client.send_mqtt_response(response)
                 self._restart_system()
-            
             # 获取配置
             elif command == VisionCoreCommands.GET_CONFIG:
                 try:
@@ -772,17 +757,74 @@ class VisionCoreApp:
                     except Exception as image_error:
                         error_msg = f"获取标定图像失败: {image_error}"
                         logger.error(error_msg)
-                        response = MQTTResponse(
-                            command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
-                            component="camera",
-                            messageType=MessageType.ERROR,
-                            message=error_msg,
-                            data={}
-                        )
+                        
+                        # 检查是否是缓冲区错误或其他需要重启相机的错误
+                        error_str = str(image_error).lower()
+                        if ("buffer" in error_str or 
+                            "something is wrong" in error_str or
+                            "connection" in error_str or
+                            "timeout" in error_str):
+                            
+                            logger.warning("检测到相机缓冲区或连接错误，尝试重启相机组件...")
+                            
+                            try:
+                                # 尝试重启相机
+                                restart_success = self.initializer._restart_camera()
+                                if restart_success:
+                                    logger.info("相机组件重启成功")
+                                    # 发送重启成功的响应
+                                    response = MQTTResponse(
+                                        command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                        component="camera",
+                                        messageType=MessageType.ERROR,
+                                        message=f"相机出现错误已自动重启: {error_msg}",
+                                        data={
+                                            "auto_restart": True,
+                                            "restart_success": True,
+                                            "original_error": error_msg
+                                        }
+                                    )
+                                else:
+                                    logger.error("相机组件重启失败")
+                                    response = MQTTResponse(
+                                        command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                        component="camera",
+                                        messageType=MessageType.ERROR,
+                                        message=f"相机错误且重启失败: {error_msg}",
+                                        data={
+                                            "auto_restart": True,
+                                            "restart_success": False,
+                                            "original_error": error_msg
+                                        }
+                                    )
+                            except Exception as restart_error:
+                                logger.error(f"重启相机时出现异常: {restart_error}")
+                                response = MQTTResponse(
+                                    command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                    component="camera",
+                                    messageType=MessageType.ERROR,
+                                    message=f"相机错误且重启异常: {error_msg}",
+                                    data={
+                                        "auto_restart": True,
+                                        "restart_success": False,
+                                        "restart_error": str(restart_error),
+                                        "original_error": error_msg
+                                    }
+                                )
+                        else:
+                            # 其他类型的错误，不重启相机
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                component="camera",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={}
+                            )
+                        
                         mqtt_client = self.initializer.get_mqtt_client()
                         if mqtt_client:
                             mqtt_client.send_mqtt_response(response)
-                    
+                
                 except Exception as e:
                     error_msg = f"执行标定图像获取命令失败: {e}"
                     logger.error(error_msg)
@@ -796,7 +838,6 @@ class VisionCoreApp:
                     mqtt_client = self.initializer.get_mqtt_client()
                     if mqtt_client:
                         mqtt_client.send_mqtt_response(response)
-            
             # 相机获取图像
             elif command == VisionCoreCommands.GET_IMAGE:
                 # 获取相机图像并上传到SFTP
@@ -907,13 +948,70 @@ class VisionCoreApp:
                     except Exception as camera_error:
                         error_msg = f"获取相机图像失败: {camera_error}"
                         logger.error(error_msg)
-                        response = MQTTResponse(
-                            command=VisionCoreCommands.GET_IMAGE.value,
-                            component="camera",
-                            messageType=MessageType.ERROR,
-                            message=error_msg,
-                            data={}
-                        )
+                        
+                        # 检查是否是缓冲区错误或其他需要重启相机的错误
+                        error_str = str(camera_error).lower()
+                        if ("buffer" in error_str or 
+                            "something is wrong" in error_str or
+                            "connection" in error_str or
+                            "timeout" in error_str):
+                            
+                            logger.warning("检测到相机缓冲区或连接错误，尝试重启相机组件...")
+                            
+                            try:
+                                # 尝试重启相机
+                                restart_success = self.initializer._restart_camera()
+                                if restart_success:
+                                    logger.info("相机组件重启成功")
+                                    # 发送重启成功的响应
+                                    response = MQTTResponse(
+                                        command=VisionCoreCommands.GET_IMAGE.value,
+                                        component="camera",
+                                        messageType=MessageType.ERROR,
+                                        message=f"相机出现错误已自动重启: {error_msg}",
+                                        data={
+                                            "auto_restart": True,
+                                            "restart_success": True,
+                                            "original_error": error_msg
+                                        }
+                                    )
+                                else:
+                                    logger.error("相机组件重启失败")
+                                    response = MQTTResponse(
+                                        command=VisionCoreCommands.GET_IMAGE.value,
+                                        component="camera",
+                                        messageType=MessageType.ERROR,
+                                        message=f"相机错误且重启失败: {error_msg}",
+                                        data={
+                                            "auto_restart": True,
+                                            "restart_success": False,
+                                            "original_error": error_msg
+                                        }
+                                    )
+                            except Exception as restart_error:
+                                logger.error(f"重启相机时出现异常: {restart_error}")
+                                response = MQTTResponse(
+                                    command=VisionCoreCommands.GET_IMAGE.value,
+                                    component="camera",
+                                    messageType=MessageType.ERROR,
+                                    message=f"相机错误且重启异常: {error_msg}",
+                                    data={
+                                        "auto_restart": True,
+                                        "restart_success": False,
+                                        "restart_error": str(restart_error),
+                                        "original_error": error_msg
+                                    }
+                                )
+                        else:
+                            # 其他类型的错误，不重启相机
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.GET_IMAGE.value,
+                                component="camera",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={}
+                            )
+                        
                         mqtt_client = self.initializer.get_mqtt_client()
                         if mqtt_client:
                             mqtt_client.send_mqtt_response(response)
@@ -931,6 +1029,7 @@ class VisionCoreApp:
                     mqtt_client = self.initializer.get_mqtt_client()
                     if mqtt_client:
                         mqtt_client.send_mqtt_response(response)
+            # SFTP测试
             elif command == VisionCoreCommands.SFTP_TEST:
                 # SFTP测试 - 上传test.png文件
                 logger.info("收到SFTP测试命令")
@@ -1125,13 +1224,71 @@ class VisionCoreApp:
                     except Exception as test_error:
                         error_msg = f"模型测试执行失败: {test_error}"
                         logger.error(error_msg)
-                        response = MQTTResponse(
-                            command=VisionCoreCommands.MODEL_TEST.value,
-                            component="detector",
-                            messageType=MessageType.ERROR,
-                            message=error_msg,
-                            data={}
-                        )
+                        
+                        # 检查是否是相机相关的错误
+                        error_str = str(test_error).lower()
+                        if ("buffer" in error_str or 
+                            "something is wrong" in error_str or
+                            "connection" in error_str or
+                            "timeout" in error_str or
+                            "camera" in error_str):
+                            
+                            logger.warning("检测到相机缓冲区或连接错误，尝试重启相机组件...")
+                            
+                            try:
+                                # 尝试重启相机
+                                restart_success = self.initializer._restart_camera()
+                                if restart_success:
+                                    logger.info("相机组件重启成功")
+                                    # 发送重启成功的响应
+                                    response = MQTTResponse(
+                                        command=VisionCoreCommands.MODEL_TEST.value,
+                                        component="camera",
+                                        messageType=MessageType.ERROR,
+                                        message=f"相机出现错误已自动重启: {error_msg}",
+                                        data={
+                                            "auto_restart": True,
+                                            "restart_success": True,
+                                            "original_error": error_msg
+                                        }
+                                    )
+                                else:
+                                    logger.error("相机组件重启失败")
+                                    response = MQTTResponse(
+                                        command=VisionCoreCommands.MODEL_TEST.value,
+                                        component="camera",
+                                        messageType=MessageType.ERROR,
+                                        message=f"相机错误且重启失败: {error_msg}",
+                                        data={
+                                            "auto_restart": True,
+                                            "restart_success": False,
+                                            "original_error": error_msg
+                                        }
+                                    )
+                            except Exception as restart_error:
+                                logger.error(f"重启相机时出现异常: {restart_error}")
+                                response = MQTTResponse(
+                                    command=VisionCoreCommands.MODEL_TEST.value,
+                                    component="camera",
+                                    messageType=MessageType.ERROR,
+                                    message=f"相机错误且重启异常: {error_msg}",
+                                    data={
+                                        "auto_restart": True,
+                                        "restart_success": False,
+                                        "restart_error": str(restart_error),
+                                        "original_error": error_msg
+                                    }
+                                )
+                        else:
+                            # 其他类型的错误，不重启相机
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.MODEL_TEST.value,
+                                component="detector",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={}
+                            )
+                        
                         mqtt_client = self.initializer.get_mqtt_client()
                         if mqtt_client:
                             mqtt_client.send_mqtt_response(response)
@@ -1148,7 +1305,7 @@ class VisionCoreApp:
                     )
                     mqtt_client = self.initializer.get_mqtt_client()
                     if mqtt_client:
-                        mqtt_client.send_mqtt_response(response)
+                        mqtt_client.send_mqtt_response(response)            
             else:
                 logger.warning(f"未知系统命令: {command}")
                 # 可以添加支持命令的提示
