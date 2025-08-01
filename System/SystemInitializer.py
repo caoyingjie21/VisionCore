@@ -266,6 +266,10 @@ class SystemInitializer:
         ip_address = connection_config.get("ip", "192.168.1.100")
         port = connection_config.get("port", 2122)
         
+        # 获取单步模式配置
+        mode_config = camera_config.get("mode", {})
+        use_single_step = mode_config.get("useSingleStep", True)
+        
         try:
             # 初始化相机实例
             from SickVision.SickSDK import QtVisionSick
@@ -286,7 +290,7 @@ class SystemInitializer:
             
             def connect_thread():
                 try:
-                    result["success"] = camera.connect()
+                    result["success"] = camera.connect(use_single_step=use_single_step)
                 except Exception as e:
                     result["error"] = str(e)
             
@@ -314,8 +318,19 @@ class SystemInitializer:
             
             if success:
                 self.logger.info(f"相机连接成功: {ip_address}:{port}")
-                self.resources['camera'] = camera
-                return True
+                
+                # 进行相机预热
+                self.logger.info("正在预热相机（获取第一帧图像）...")
+                warmup_success = self._warmup_camera(camera)
+                
+                if warmup_success:
+                    self.logger.info("相机预热成功")
+                    self.resources['camera'] = camera
+                    return True
+                else:
+                    self.logger.warning("相机预热失败，但相机连接正常，将继续运行")
+                    self.resources['camera'] = camera
+                    return True  # 即使预热失败也继续运行
             else:
                 error_msg = f"相机连接失败: {ip_address}:{port}"
                 self.logger.error(error_msg)
@@ -325,6 +340,73 @@ class SystemInitializer:
             error_msg = f"相机初始化异常: {str(e)}"
             self.logger.error(error_msg)
             self._notify_component_failure("camera", error_msg)
+            return False
+
+    def _warmup_camera(self, camera) -> bool:
+        """
+        预热相机 - 获取第一帧图像以减少后续检测的延迟
+        
+        Args:
+            camera: 相机实例
+            
+        Returns:
+            bool: 预热是否成功
+        """
+        try:
+            # 设置较短的超时时间进行预热
+            import threading
+            import time
+            
+            warmup_result = {"success": False, "error": None, "timing": 0}
+            
+            def warmup_thread():
+                try:
+                    start_time = time.time()
+                    
+                    # 尝试获取一帧图像
+                    success, depth_data, frame, camera_params = camera.get_frame()
+                    
+                    end_time = time.time()
+                    warmup_result["timing"] = (end_time - start_time) * 1000  # 转为毫秒
+                    
+                    if success and frame is not None:
+                        # 检查图像有效性
+                        if hasattr(frame, 'shape') and len(frame.shape) >= 2:
+                            height, width = frame.shape[:2]
+                            if height > 0 and width > 0:
+                                warmup_result["success"] = True
+                                self.logger.info(f"相机预热成功: 获取到图像 {width}x{height}, 耗时: {warmup_result['timing']:.1f}ms")
+                            else:
+                                warmup_result["error"] = f"获取到无效图像尺寸: {frame.shape}"
+                        else:
+                            warmup_result["error"] = f"获取到的不是有效图像数据: {type(frame)}"
+                    else:
+                        warmup_result["error"] = "无法获取相机图像数据"
+                        
+                except Exception as e:
+                    warmup_result["error"] = str(e)
+            
+            # 创建预热线程
+            thread = threading.Thread(target=warmup_thread, daemon=True)
+            start_time = time.time()
+            thread.start()
+            
+            # 等待预热完成，最多5秒
+            timeout_seconds = 5.0
+            while thread.is_alive() and (time.time() - start_time) < timeout_seconds:
+                time.sleep(0.1)
+            
+            if thread.is_alive():
+                self.logger.warning("相机预热超时(5秒)，但将继续运行")
+                return False
+            elif warmup_result["error"]:
+                self.logger.warning(f"相机预热失败: {warmup_result['error']}")
+                return False
+            else:
+                return warmup_result["success"]
+                
+        except Exception as e:
+            self.logger.warning(f"相机预热异常: {e}")
             return False
     
     def _wait_for_model_file(self, model_path: str) -> bool:
@@ -386,10 +468,7 @@ class SystemInitializer:
                         # 预热失败，释放检测器资源
                         self.logger.error("模型预热失败，检测器初始化失败")
                         try:
-                            if hasattr(detector, 'release'):
-                                detector.release()
-                            elif hasattr(detector, 'model') and hasattr(detector.model, 'cpu'):
-                                detector.model.cpu()
+                            detector.release()
                         except:
                             pass
                         return {"result": None, "error": f"模型预热失败: {warmup_error}", "error_type": "warmup_failed"}
@@ -573,20 +652,20 @@ class SystemInitializer:
                     if catch_handler:
                         return catch_handler(client_id, message)
                     else:
-                        # 通过MQTT发送错误通知
+                        # 通过MQTT发送错误通知，但不向TCP客户端返回任何数据
                         self._notify_component_failure("tcp_handler", f"catch处理器未设置 (客户端: {client_id})")
-                        return "0,0.000,0.000,0.000,0.000"
+                        return None  # 不返回任何数据
                 else:
                     self.logger.debug(f"未处理的消息: {message} from {client_id}")
-                    # 通过MQTT发送错误通知
+                    # 通过MQTT发送错误通知，但不向TCP客户端返回任何数据
                     self._notify_component_failure("tcp_handler", f"不支持的消息: {message} (客户端: {client_id})")
-                    return "0,0.000,0.000,0.000,0.000"
+                    return None  # 不返回任何数据，因为只有catch指令才应该有响应
                     
             except Exception as e:
                 self.logger.error(f"处理TCP消息时出错: {e}")
-                # 通过MQTT发送错误通知
+                # 通过MQTT发送错误通知，但不向TCP客户端返回任何数据
                 self._notify_component_failure("tcp_handler", f"消息处理失败: {str(e)} (客户端: {client_id})")
-                return "0,0.000,0.000,0.000,0.000"
+                return None  # 不返回任何数据
         
         return handle_tcp_message
     
@@ -756,6 +835,16 @@ class SystemInitializer:
                 conf_threshold=0.7,
                 nms_threshold=0.45
             )
+            
+            # 检查变换矩阵加载状态并记录日志
+            matrix_status = detector.get_transformation_matrix_status()
+            if matrix_status['loaded']:
+                metadata = matrix_status['metadata']
+                self.logger.info(f"变换矩阵加载成功，标定点数: {metadata.get('calibration_points_count', 0)}, "
+                               f"RMSE: {metadata.get('calibration_rmse', 0.0):.3f}mm")
+            else:
+                self.logger.warning(f"变换矩阵加载失败: {matrix_status.get('error', '未知错误')}")
+            
             self.logger.info("创建RKNN检测器成功")
             return detector
                 
@@ -778,71 +867,55 @@ class SystemInitializer:
             test_image_path = "./Models/test.jpg"
             
             if not os.path.exists(test_image_path):
-                if self.logger:
-                    self.logger.warning(f"测试图片不存在: {test_image_path}，使用随机数据预热")
-                else:
-                    print(f"测试图片不存在: {test_image_path}，使用随机数据预热")
+                return False, f"测试图片不存在: {test_image_path}"
+            
+            # 加载测试图片
+            try:
+                import cv2
+                test_input = cv2.imread(test_image_path)
+                if test_input is None:
+                    return False, f"无法读取测试图片: {test_image_path}"
                 
-                # 回退到随机数据
-                import numpy as np
-                test_input = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-            else:
-                # 加载测试图片
-                try:
-                    import cv2
-                    test_input = cv2.imread(test_image_path)
-                    if test_input is None:
-                        raise Exception("cv2无法读取图片")
-                    
-                    if self.logger:
-                        self.logger.info(f"使用测试图片进行预热: {test_image_path}")
-                        self.logger.info(f"图片尺寸: {test_input.shape}")
-                    else:
-                        print(f"使用测试图片进行预热: {test_image_path}")
-                        print(f"图片尺寸: {test_input.shape}")
-                    
-                except ImportError:
-                    if self.logger:
-                        self.logger.warning("OpenCV未安装，尝试使用PIL")
-                    try:
-                        from PIL import Image
-                        import numpy as np
-                        pil_image = Image.open(test_image_path)
-                        test_input = np.array(pil_image)
-                        
-                        # 确保是RGB格式
-                        if len(test_input.shape) == 3 and test_input.shape[2] == 3:
-                            # PIL默认是RGB，转换为BGR（如果需要）
-                            test_input = cv2.cvtColor(test_input, cv2.COLOR_RGB2BGR) if 'cv2' in locals() else test_input
-                        
-                        if self.logger:
-                            self.logger.info(f"使用PIL加载测试图片: {test_image_path}")
-                            self.logger.info(f"图片尺寸: {test_input.shape}")
-                    except ImportError:
-                        if self.logger:
-                            self.logger.warning("PIL也未安装，使用随机数据预热")
-                        # 回退到随机数据
-                        import numpy as np
-                        test_input = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-                    except Exception as e:
-                        return False, f"PIL加载图片失败: {str(e)}"
-                except Exception as e:
-                    return False, f"OpenCV加载图片失败: {str(e)}"
+                if self.logger:
+                    self.logger.info(f"使用测试图片进行预热: {test_image_path}")
+                    self.logger.info(f"图片尺寸: {test_input.shape}")
+                else:
+                    print(f"使用测试图片进行预热: {test_image_path}")
+                    print(f"图片尺寸: {test_input.shape}")
+                
+            except ImportError:
+                return False, "OpenCV未安装，无法读取测试图片"
+            except Exception as e:
+                return False, f"读取测试图片失败: {str(e)}"
             
             if self.logger:
-                self.logger.info("开始模型预热...")
+                self.logger.info("开始模型预热（多次推理以充分预热）...")
             else:
-                print("开始模型预热...")
+                print("开始模型预热（多次推理以充分预热）...")
             
-            # 进行一次预热推理
+            # 进行多次预热推理以确保模型完全预热
+            warmup_rounds = 1  # 进行5次预热
             try:
-                results = detector.detect(test_input)
-                detection_count = self._parse_rknn_results(results)
-                # 输出检测结果
+                for i in range(warmup_rounds):
+                    if self.logger:
+                        self.logger.debug(f"执行第{i+1}次预热推理...")
+                    else:
+                        print(f"执行第{i+1}次预热推理...")
+                    
+                    start_time = time.time()
+                    _ = detector.detect(test_input)
+                    end_time = time.time()
+                    
+                    warmup_time = (end_time - start_time) * 1000
+                    if self.logger:
+                        self.logger.debug(f"第{i+1}次预热耗时: {warmup_time:.1f}ms")
+                    else:
+                        print(f"第{i+1}次预热耗时: {warmup_time:.1f}ms")
+                
                 if self.logger:
-                    self.logger.info(f"模型预热完成，检测到 {detection_count} 个目标")
+                    self.logger.info(f"模型预热完成，共执行{warmup_rounds}次推理")
                 else:
-                    print(f"模型预热完成，检测到 {detection_count} 个目标")
+                    print(f"模型预热完成，共执行{warmup_rounds}次推理")
                 
                 return True, None
                     
@@ -862,192 +935,6 @@ class SystemInitializer:
                 print(f"模型预热异常: {error_detail}")
             return False, error_detail
 
-    def _warmup_model(self, detector) -> bool:
-        """
-        预热模型（使用test.jpg测试图片）
-        
-        Args:
-            detector: 检测器实例
-            
-        Returns:
-            预热是否成功
-        """
-        try:
-            # 查找测试图片
-            test_image_path = "./Models/test.jpg"
-            
-            if not os.path.exists(test_image_path):
-                if self.logger:
-                    self.logger.warning(f"测试图片不存在: {test_image_path}，使用随机数据预热")
-                else:
-                    print(f"测试图片不存在: {test_image_path}，使用随机数据预热")
-                
-                # 回退到随机数据
-                import numpy as np
-                test_input = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-            else:
-                # 加载测试图片
-                try:
-                    import cv2
-                    test_input = cv2.imread(test_image_path)
-                    if test_input is None:
-                        raise Exception("cv2无法读取图片")
-                    
-                    if self.logger:
-                        self.logger.info(f"使用测试图片进行预热: {test_image_path}")
-                        self.logger.info(f"图片尺寸: {test_input.shape}")
-                    else:
-                        print(f"使用测试图片进行预热: {test_image_path}")
-                        print(f"图片尺寸: {test_input.shape}")
-                    
-                except ImportError:
-                    if self.logger:
-                        self.logger.warning("OpenCV未安装，尝试使用PIL")
-                    try:
-                        from PIL import Image
-                        import numpy as np
-                        pil_image = Image.open(test_image_path)
-                        test_input = np.array(pil_image)
-                        
-                        # 确保是RGB格式
-                        if len(test_input.shape) == 3 and test_input.shape[2] == 3:
-                            # PIL默认是RGB，转换为BGR（如果需要）
-                            test_input = cv2.cvtColor(test_input, cv2.COLOR_RGB2BGR) if 'cv2' in locals() else test_input
-                        
-                        if self.logger:
-                            self.logger.info(f"使用PIL加载测试图片: {test_image_path}")
-                            self.logger.info(f"图片尺寸: {test_input.shape}")
-                    except ImportError:
-                        if self.logger:
-                            self.logger.warning("PIL也未安装，使用随机数据预热")
-                        # 回退到随机数据
-                        import numpy as np
-                        test_input = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-                except Exception as e:
-                    if self.logger:
-                        self.logger.warning(f"读取测试图片失败: {e}，使用随机数据预热")
-                    # 回退到随机数据
-                    import numpy as np
-                    test_input = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-            
-            if self.logger:
-                self.logger.info("开始模型预热...")
-            else:
-                print("开始模型预热...")
-            
-            # 进行一次预热推理
-            try:
-                results = detector.detect(test_input)
-                detection_count = self._parse_rknn_results(results)
-                # 输出检测结果
-                if self.logger:
-                    self.logger.info(f"模型预热完成，检测到 {detection_count} 个目标")
-                else:
-                    print(f"模型预热完成，检测到 {detection_count} 个目标")
-                
-                return True
-                    
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"模型预热失败: {e}")
-                else:
-                    print(f"模型预热失败: {e}")
-                return False
-            
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"模型预热失败: {e}")
-            else:
-                print(f"模型预热失败: {e}")
-            return False
-    
-    def _parse_yolo_results(self, results) -> int:
-        """
-        解析PyTorch YOLO模型的检测结果
-        
-        Args:
-            results: YOLO模型的检测结果
-            
-        Returns:
-            检测到的目标数量
-        """
-        try:
-            if results is None:
-                return 0
-            
-            # ultralytics YOLO结果通常是一个列表，每个元素是一个Result对象
-            if isinstance(results, list):
-                if len(results) > 0 and hasattr(results[0], 'obb'):
-                    # ultralytics格式
-                    results[0].save()
-                    return results[0].obb.shape[0]
-                else:
-                    return len(results) if results else 0
-            
-            # 单个结果对象
-            elif hasattr(results, 'obb'):
-                results.save()
-                return results.obb.shape[0] if results.obb is not None else 0
-            elif hasattr(results, 'boxes'):
-                return len(results.boxes) if results.boxes is not None else 0
-            
-            # 其他格式，尝试获取长度
-            elif hasattr(results, '__len__'):
-                return len(results)
-            
-            else:
-                return 0 if results is None else 1
-                
-        except Exception as e:
-            if self.logger:
-                self.logger.debug(f"解析YOLO结果失败: {e}")
-            return 0
-    
-    def _parse_rknn_results(self, results) -> int:
-        """
-        解析RKNN模型的检测结果
-        
-        Args:
-            results: RKNN模型的检测结果
-            
-        Returns:
-            检测到的目标数量
-        """
-        try:
-            if results is None:
-                return 0
-            
-            # RKNN结果通常是一个包含检测框的列表或数组
-            if isinstance(results, (list, tuple)):
-                return len(results)
-            
-            # 如果是numpy数组
-            elif hasattr(results, 'shape'):
-                # 通常RKNN返回的是(N, 6)格式，N是检测数量
-                if len(results.shape) == 2:
-                    return results.shape[0]
-                elif len(results.shape) == 1:
-                    return len(results)
-                else:
-                    return 0
-            
-            # 如果结果是字典格式
-            elif isinstance(results, dict):
-                if 'detections' in results:
-                    return len(results['detections'])
-                elif 'boxes' in results:
-                    return len(results['boxes'])
-                else:
-                    return 0
-            
-            else:
-                return 0 if results is None else 1
-                
-        except Exception as e:
-            if self.logger:
-                self.logger.debug(f"解析RKNN结果失败: {e}")
-            return 0
-    
     def initialize_all_components(self) -> bool:
         """初始化所有系统组件"""
         try:
@@ -1223,22 +1110,9 @@ class SystemInitializer:
                     # 检查检测器类型并选择合适的清理方法
                     detector_type = type(old_detector).__name__
                     
-                    if hasattr(old_detector, 'release'):
-                        # RKNN_YOLO类型，有release方法
-                        old_detector.release()
-                        self.logger.info(f"{detector_type}检测器已释放")
-                    elif hasattr(old_detector, 'model') and hasattr(old_detector.model, 'cpu'):
-                        # ultralytics YOLO类型，将模型移到CPU并清理
-                        try:
-                            old_detector.model.cpu()  # 将模型移到CPU
-                            if hasattr(old_detector, 'predictor'):
-                                old_detector.predictor = None  # 清理预测器
-                            self.logger.info(f"{detector_type}检测器已清理")
-                        except Exception as e:
-                            self.logger.warning(f"{detector_type}检测器清理部分失败: {e}")
-                    else:
-                        # 其他类型的检测器，尝试通用清理
-                        self.logger.info(f"{detector_type}检测器已移除（无特定清理方法）")
+                    # RKNN_YOLO类型，有release方法
+                    old_detector.release()
+                    self.logger.info(f"{detector_type}检测器已释放")
                         
                 except Exception as e:
                     self.logger.warning(f"清理旧检测器时出现异常: {e}")
@@ -1620,26 +1494,10 @@ class SystemInitializer:
                 # 检查检测器类型并选择合适的清理方法
                 detector_type = type(detector).__name__
                 
-                if hasattr(detector, 'release'):
-                    # RKNN_YOLO类型，有release方法
-                    detector.release()
-                    if self.logger:
-                        self.logger.info(f"{detector_type}检测器已释放")
-                elif hasattr(detector, 'model') and hasattr(detector.model, 'cpu'):
-                    # ultralytics YOLO类型，将模型移到CPU并清理
-                    try:
-                        detector.model.cpu()  # 将模型移到CPU
-                        if hasattr(detector, 'predictor'):
-                            detector.predictor = None  # 清理预测器
-                        if self.logger:
-                            self.logger.info(f"{detector_type}检测器已清理")
-                    except Exception as e:
-                        if self.logger:
-                            self.logger.warning(f"{detector_type}检测器清理部分失败: {e}")
-                else:
-                    # 其他类型的检测器，尝试通用清理
-                    if self.logger:
-                        self.logger.info(f"{detector_type}检测器已移除（无特定清理方法）")
+                # RKNN_YOLO类型，有release方法
+                detector.release()
+                if self.logger:
+                    self.logger.info(f"{detector_type}检测器已释放")
                         
             except Exception as e:
                 if self.logger:

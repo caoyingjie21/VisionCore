@@ -40,6 +40,7 @@ class TcpServer:
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         self.message_callback = message_callback
+        self.disconnect_callback: Optional[Callable] = None  # 添加断开连接回调
         
         # 服务器配置
         self.host = config.get("host", "0.0.0.0")
@@ -73,6 +74,10 @@ class TcpServer:
     def set_message_callback(self, callback: Callable):
         """设置消息处理回调函数"""
         self.message_callback = callback
+    
+    def set_disconnect_callback(self, callback: Callable):
+        """设置客户端断开连接回调函数"""
+        self.disconnect_callback = callback
     
     def start(self) -> bool:
         """
@@ -215,14 +220,14 @@ class TcpServer:
                                     response = self.message_callback(client_id, line)
                                     if response:
                                         self._send_message(client_socket, response)
+                                    # 移除错误响应，因为TCP服务端只应该在catch指令成功时回传数据
                                 except Exception as e:
                                     self.logger.error(f"消息回调处理失败: {e}")
-                                    error_response = f"消息处理失败: {str(e)}\r\n"
-                                    self._send_message(client_socket, error_response)
+                                    # 不发送错误响应，保持静默
                             else:
-                                # 如果没有设置回调，返回默认响应
-                                default_response = f"消息已接收，但未设置处理器\r\n"
-                                self._send_message(client_socket, default_response)
+                                # 如果没有设置回调，不发送任何响应，保持静默
+                                # TCP服务端只应该在收到catch指令时回传检测数据
+                                self.logger.debug(f"收到消息但未设置处理器: {line} from {client_id}")
                 
                 except socket.timeout:
                     continue
@@ -262,6 +267,13 @@ class TcpServer:
                 client_info.is_active = False
                 self.stats["current_connections"] = len(self.clients)
                 self.logger.info(f"客户端断开: {client_id} - {reason}")
+                
+                # 调用断开连接回调函数
+                if self.disconnect_callback:
+                    try:
+                        self.disconnect_callback(client_id, reason)
+                    except Exception as e:
+                        self.logger.error(f"断开连接回调处理失败: {e}")
     
     def _heartbeat_monitor(self):
         """心跳监控线程"""

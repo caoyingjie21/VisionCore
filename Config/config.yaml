@@ -18,7 +18,7 @@ detectionServer:
   connection_timeout: 300
   enabled: true
   heartbeat_interval: 30
-  host: 127.0.0.1
+  host: 192.168.2.100
   keep_alive: true
   max_connections: 15
   message:
@@ -57,7 +57,7 @@ model:
   selectedModel: seasoning256.pt
 mqtt:
   connection:
-    broker_host: localhost
+    broker_host: 192.168.2.15
     broker_port: 1883
     client_id: sickvision_headless
     keepalive: 60
@@ -78,11 +78,11 @@ mqtt:
     subscribe:
       system_command: sickvision/system/command
 roi:
-  centerXOffset: 16
-  centerYOffset: 7
+  centerXOffset: 25
+  centerYOffset: 50
   enable: true
-  height: 199
-  width: 190
+  height: 120
+  width: 120
 sftp:
   connection:
     retry_attempts: 3
@@ -97,10 +97,20 @@ sftp:
     overwrite_existing: true
     verify_checksum: true
   username: qt
+detection:
+  saveImage:
+    enabled: true                    # 是否启用图像保存功能
+    directory: "./saved_images"      # 图像保存目录
+    uploadToSftp: false              # 是否上传到SFTP服务器
+    autoCleanup: true                # 是否自动清理旧文件
+    maxFiles: 100                    # 最大保存文件数量
+    quality: 95                      # JPEG质量 (1-100)
 stability:
-  detectionCount: 5
-  isEnabled: true
-  threshold: 1
+  detectionCount: 1            # 单步模式下只需要检测1次
+  isEnabled: false             # 单步模式下禁用稳定性检测
+  pixelThreshold: 5.0          # 稳定性检测的像素阈值（单步模式下不使用）
+  debounceTime: 2.0            # TCP防抖时间（秒）
+  zOffset: -10               # Z坐标补偿值
 system:
   debug: false
   log_level: INFO

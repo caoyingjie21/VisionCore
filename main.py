@@ -12,7 +12,9 @@ import signal
 import os
 from typing import Dict, Any
 import json
-
+import cv2
+import numpy as np
+from Rknn.RknnYolo import RKNN_YOLO
 from System.SystemInitializer import SystemInitializer
 from ClassModel.MqttResponse import MQTTResponse
 from utils.decorators import handle_keyboard_interrupt
@@ -34,6 +36,13 @@ class VisionCoreApp:
         self.initializer = None
         self.running = True
         self.restart_on_failure = True
+    
+        # 防抖和性能监控（默认值，将从配置文件中读取）
+        self.last_tcp_command_time = {}  # 记录每个客户端的最后命令时间
+        self.tcp_processing_flags = {}   # 记录每个客户端的处理状态
+        self.tcp_debounce_time = 2.0     # 防抖时间间隔（秒）
+        self.z_offset = 0.0              # Z坐标补偿值
+        self.pixel_threshold = 5.0       # 稳定性检测像素阈值
     
     def start(self):
         """启动应用程序主循环"""
@@ -98,7 +107,20 @@ class VisionCoreApp:
             
             # 初始化配置
             if not self.initializer.initialize_config():
+                print("配置初始化失败")
                 return False
+            
+            # 从配置文件读取防抖和性能监控参数
+            config_mgr = self.initializer.get_config_manager()
+            if config_mgr:
+                debounce_time = config_mgr.get_config("stability.debounceTime")
+                z_offset = config_mgr.get_config("stability.zOffset")
+                pixel_threshold = config_mgr.get_config("stability.pixelThreshold")
+                
+                self.tcp_debounce_time = debounce_time if debounce_time is not None else 2.0
+                self.z_offset = z_offset if z_offset is not None else 0.0
+                self.pixel_threshold = pixel_threshold if pixel_threshold is not None else 5.0
+                print(f"已加载配置: 防抖时间={self.tcp_debounce_time}s, Z补偿={self.z_offset}, 像素阈值={self.pixel_threshold}")
             
             # 初始化所有组件
             if not self.initializer.initialize_all_components():
@@ -125,6 +147,9 @@ class VisionCoreApp:
         if tcp_server:
             message_handler = self.initializer.create_tcp_message_handler(self.handle_catch)
             tcp_server.set_message_callback(message_handler)
+            
+            # 设置客户端断开连接的回调
+            tcp_server.set_disconnect_callback(self.handle_tcp_client_disconnected)
             logger.info("TCP服务器消息处理器已设置")
         
         # 为MQTT客户端设置消息处理回调
@@ -160,7 +185,7 @@ class VisionCoreApp:
     
     def handle_catch(self, client_id: str, message: str):
         """
-        处理catch指令
+        处理catch指令 - 单步模式下进行快速单次检测（优化版）
         
         Args:
             client_id: 客户端ID
@@ -169,68 +194,786 @@ class VisionCoreApp:
         Returns:
             str: 响应消息字符串
         """
+        # 记录整个流程的开始时间
+        process_start_time = time.time()
+        current_time = time.time()
+        
         logger = self.initializer.logger
-        logger.info(f"收到catch指令来自客户端: {client_id}, 消息: {message}")
+        logger.info(f"收到catch指令来自客户端: {client_id}")
         
         try:
+            # 防抖检查：检查是否在防抖时间内收到重复命令
+            if client_id in self.last_tcp_command_time:
+                time_since_last_command = current_time - self.last_tcp_command_time[client_id]
+                if time_since_last_command < self.tcp_debounce_time:
+                    logger.debug(f"防抖: 忽略来自 {client_id} 的重复catch命令 (距离上次: {time_since_last_command*1000:.1f}ms)")
+                    return "0,0.000,0.000,0.000,0.000"
+            
+            # 检查是否正在处理该客户端的命令
+            if self.tcp_processing_flags.get(client_id, False):
+                logger.debug(f"防抖: 客户端 {client_id} 的命令正在处理中，忽略新命令")
+                return "0,0.000,0.000,0.000,0.000"
+            
+            # 记录命令时间和处理状态
+            self.last_tcp_command_time[client_id] = current_time
+            self.tcp_processing_flags[client_id] = True
+            
             # 获取系统组件
             camera = self.initializer.get_camera()
             detector = self.initializer.get_detector()
-            mqtt_client = self.initializer.get_mqtt_client()
+            configManager = self.initializer.get_config_manager()
             
             # 检查组件是否可用
             if not camera:
-                logger.warning("catch指令执行失败: 相机未初始化或未连接")
-                # 通过MQTT发送错误通知
+                elapsed_time = (time.time() - process_start_time) * 1000
+                logger.warning(f"相机未就绪，向 {client_id} 发送默认数据 (耗时: {elapsed_time:.1f}ms)")
                 self.initializer._notify_component_failure("camera", f"相机未初始化或未连接 (客户端: {client_id})")
                 return "0,0.000,0.000,0.000,0.000"
             
             if not detector:
-                logger.warning("catch指令执行失败: 检测器未初始化")
-                # 通过MQTT发送错误通知
+                elapsed_time = (time.time() - process_start_time) * 1000
+                logger.warning(f"检测器未初始化，向 {client_id} 发送默认数据 (耗时: {elapsed_time:.1f}ms)")
                 self.initializer._notify_component_failure("detector", f"检测器未初始化 (客户端: {client_id})")
                 return "0,0.000,0.000,0.000,0.000"
             
-            # 执行实际的catch逻辑
-            try:
-                logger.info("开始执行catch操作...")
-                
-                # TODO: 在这里添加具体的catch实现
-                # 1. 获取相机图像
-                if hasattr(camera, 'get_fresh_frame'):
-                    image = camera.get_fresh_frame()
-                    if image is not None:
-                        logger.info("成功获取相机图像")
-                        
-                        # 2. 进行目标检测
-                        results = detector.detect(image)
-                        logger.info(f"检测完成，发现 {len(results)} 个目标")
-                        
-                        # 临时返回：检测个数,0.000,0.000,0.000,0.000
-                        # TODO: 这里需要根据实际的检测结果返回正确的坐标数据
-                        return f"{len(results)},0.000,0.000,0.000,0.000"
-                       
-                    else:
-                        logger.error("无法获取相机图像")
-                        # 通过MQTT发送错误通知
-                        self.initializer._notify_component_failure("camera", f"无法获取相机图像 (客户端: {client_id})")
-                        return "0,0.000,0.000,0.000,0.000"
-                
-                # 临时响应（在实现具体逻辑前）
-                logger.info("catch指令已接收，功能正在开发中")
+            if not configManager:
+                elapsed_time = (time.time() - process_start_time) * 1000
+                logger.warning(f"配置管理器未初始化，向 {client_id} 发送默认数据 (耗时: {elapsed_time:.1f}ms)")
+                self.initializer._notify_component_failure("configManager", f"配置管理器未初始化 (客户端: {client_id})")
                 return "0,0.000,0.000,0.000,0.000"
+
+            # 获取配置
+            enable_roi = configManager.get_config("roi.enable")
+            enable_stability = configManager.get_config("stability.isEnabled")
+            
+            # 处理配置值的默认值
+            enable_roi = enable_roi if enable_roi is not None else False
+            enable_stability = enable_stability if enable_stability is not None else False
+            
+            # 记录相机模式信息
+            camera_mode = "单步模式" if camera.use_single_step else "连续流模式"
+            logger.info(f"相机模式: {camera_mode}")
+            
+            # 执行检测（单步模式推荐使用单次检测）
+            detection_start_time = time.time()
+            if enable_stability and not camera.use_single_step:
+                # 仅在连续流模式下才建议使用稳定性检测
+                logger.info("连续流模式下执行稳定性检测")
+                final_result = self._perform_stable_detection(client_id, camera, detector, configManager)
+            else:
+                # 单步模式下或禁用稳定性检测时，执行单次检测
+                if camera.use_single_step:
+                    logger.info("单步模式: 执行快速单次检测（推荐）")
+                else:
+                    logger.info("稳定性检测已禁用: 执行单次检测")
+                final_result = self._perform_single_detection(camera, detector, configManager)
+            
+            detection_time = (time.time() - detection_start_time) * 1000  # 转换为毫秒
+            
+            # 构造并发送响应数据
+            response_start_time = time.time()
+            if final_result:
+                detection_count = final_result.get('detection_count', 0)
+                best_target = final_result.get('best_target')
+                
+                if best_target is not None and best_target.get('robot_3d') is not None:
+                    # 有有效目标，发送完整坐标数据
+                    x, y, z = best_target['robot_3d']
+                    angle = best_target.get('angle', 0.0)
+                    
+                    # 应用Z坐标补偿
+                    z_compensated = z + self.z_offset
+                    
+                    # 构造数据格式：检测个数,x,y,z,angle
+                    response_data = f"{detection_count},{x:.3f},{y:.3f},{z_compensated:.3f},{angle:.3f}"
+                    
+                    # 计算总耗时和响应构造时间
+                    total_time = (time.time() - process_start_time) * 1000
+                    response_time = (time.time() - response_start_time) * 1000
+                    
+                    # 获取检测过程中的详细耗时信息
+                    timing_info = final_result.get('timing', {})
+                    frame_time = timing_info.get('frame_time', 0)
+                    roi_time = timing_info.get('roi_time', 0)
+                    model_detect_time = timing_info.get('detect_time', 0)
+                    coord_time = timing_info.get('coord_time', 0)
+                    save_time = timing_info.get('save_time', 0)
+                    
+                    logger.info(f"检测完成，发送坐标给 {client_id}: 检测个数={detection_count}, "
+                               f"X={x:.3f}, Y={y:.3f}, Z={z_compensated:.3f}, A={angle:.3f}")
+                    logger.info(f"详细耗时分析:")
+                    logger.info(f"  1. 获取图像: {frame_time:.1f}ms")
+                    logger.info(f"  2. ROI计算: {roi_time:.1f}ms")
+                    logger.info(f"  3. 模型检测: {model_detect_time:.1f}ms")
+                    logger.info(f"  4. 坐标转换: {coord_time:.1f}ms")
+                    logger.info(f"  5. 保存图像: {save_time:.1f}ms")
+                    logger.info(f"  6. 响应构造: {response_time:.1f}ms")
+                    logger.info(f"  总耗时: {total_time:.1f}ms")
+                    
+                    return response_data
+                else:
+                    # 没有有效目标或坐标转换失败，发送检测个数为0
+                    response_data = "0,0.000,0.000,0.000,0.000"
+                        
+                    # 计算总耗时和响应构造时间
+                    total_time = (time.time() - process_start_time) * 1000
+                    response_time = (time.time() - response_start_time) * 1000
+                    
+                    # 获取检测过程中的详细耗时信息
+                    timing_info = final_result.get('timing', {})
+                    frame_time = timing_info.get('frame_time', 0)
+                    roi_time = timing_info.get('roi_time', 0)
+                    model_detect_time = timing_info.get('detect_time', 0)
+                    coord_time = timing_info.get('coord_time', 0)
+                    save_time = timing_info.get('save_time', 0)
+                        
+                    logger.info(f"检测完成，但没有有效目标，发送默认数据给 {client_id}")
+                    logger.info(f"详细耗时分析:")
+                    logger.info(f"  1. 获取图像: {frame_time:.1f}ms")
+                    logger.info(f"  2. ROI计算: {roi_time:.1f}ms")
+                    logger.info(f"  3. 模型检测: {model_detect_time:.1f}ms")
+                    logger.info(f"  4. 坐标转换: {coord_time:.1f}ms")
+                    logger.info(f"  5. 保存图像: {save_time:.1f}ms")
+                    logger.info(f"  6. 响应构造: {response_time:.1f}ms")
+                    logger.info(f"  总耗时: {total_time:.1f}ms")
+                    
+                    return response_data
+            else:
+                # 检测失败，发送默认数据
+                response_data = "0,0.000,0.000,0.000,0.000"
+                    
+                # 计算总耗时和响应构造时间
+                total_time = (time.time() - process_start_time) * 1000
+                response_time = (time.time() - response_start_time) * 1000
+                    
+                logger.error(f"检测失败，发送默认数据给 {client_id}")
+                logger.error(f"详细耗时分析:")
+                logger.error(f"  检测耗时: {detection_time:.1f}ms")
+                logger.error(f"  响应构造: {response_time:.1f}ms")
+                logger.error(f"  总耗时: {total_time:.1f}ms")
+                
+                return response_data
+                        
+        except Exception as e:
+            total_time = (time.time() - process_start_time) * 1000
+            logger.error(f"处理 {client_id} 的catch命令时出错: {str(e)} (总耗时: {total_time:.1f}ms)", exc_info=True)
+            # 通过MQTT发送错误通知
+            self.initializer._notify_component_failure("catch_execution", f"catch执行失败: {str(e)} (客户端: {client_id})")
+            return "0,0.000,0.000,0.000,0.000"
+        finally:
+            # 清除处理标志，允许后续命令处理
+            if client_id in self.tcp_processing_flags:
+                self.tcp_processing_flags[client_id] = False
+    
+    def _perform_stable_detection(self, client_id: str, camera, detector, configManager):
+        """
+        执行稳定性检测，直到连续两次结果稳定或达到最大检测次数
+        
+        Args:
+            client_id: 客户端ID
+            camera: 相机实例
+            detector: 检测器实例
+            configManager: 配置管理器
+            
+        Returns:
+            dict: 最终检测结果
+        """
+        logger = self.initializer.logger
+        detection_results = []
+        last_stable_result = None
+        
+        stability_num = configManager.get_config("stability.detectionCount")
+        stability_num = stability_num if stability_num is not None else 5
+        
+        # 从配置获取稳定性检测延迟
+        stabilize_delay = configManager.get_config("camera.buffer.stabilizeDelay")
+        stabilize_delay = stabilize_delay if stabilize_delay is not None else 0.1
+        
+        logger.info(f"开始稳定性检测，最大尝试次数: {stability_num}")
+        
+        for attempt in range(stability_num):
+            try:
+                # 在检测之间添加配置的延迟，确保相机缓冲区稳定
+                if attempt > 0:
+                    logger.debug(f"等待相机稳定，准备第{attempt + 1}次检测")
+                    time.sleep(stabilize_delay)
+                
+                # 执行2D检测（带重试机制）
+                detection_result = self._perform_2d_detection_with_retry(camera, detector, configManager, attempt + 1)
+                
+                if detection_result is None:
+                    logger.warning(f"第{attempt + 1}次检测失败")
+                    continue
+                        
+                detection_results.append(detection_result)
+                
+                # 如果是第一次检测，记录结果并继续
+                if attempt == 0:
+                    logger.debug(f"第{attempt + 1}次检测完成，检测到{detection_result.get('detection_count', 0)}个目标")
+                    continue
+                
+                # 从第二次开始检查稳定性
+                previous_result = detection_results[attempt - 1]
+                current_result = detection_result
+                
+                # 检查稳定性（基于2D坐标）
+                is_stable = self._check_detection_stability(current_result, previous_result)
+                
+                if is_stable:
+                    logger.info(f"第{attempt + 1}次检测：结果稳定，开始3D坐标计算")
+                    # 检测稳定后，进行3D坐标转换
+                    final_result = self._perform_3d_coordinate_calculation(current_result, camera, detector, configManager)
+                    last_stable_result = final_result
+                    break
+                else:
+                    logger.debug(f"第{attempt + 1}次检测：结果不稳定，继续检测")
+                    
+            except Exception as e:
+                logger.error(f"第{attempt + 1}次稳定性检测时出错: {str(e)}")
+                continue
+        
+        # 如果没有达到稳定状态，使用最后一次检测结果
+        if last_stable_result is None and detection_results:
+            logger.warning("未达到稳定状态，使用最后一次检测结果")
+            last_result = detection_results[-1]
+            last_stable_result = self._perform_3d_coordinate_calculation(last_result, camera, detector, configManager)
+            
+        return last_stable_result
+
+    def _perform_2d_detection_with_retry(self, camera, detector, configManager, attempt_num):
+        """
+        执行2D检测，带重试机制处理缓冲区错误
+        
+        Args:
+            camera: 相机实例
+            detector: 检测器实例
+            configManager: 配置管理器
+            attempt_num: 检测尝试次数
+        
+        Returns:
+            dict: 2D检测结果字典
+        """
+        logger = self.initializer.logger
+        
+        # 从配置获取重试参数
+        max_retries = configManager.get_config("camera.buffer.retryAttempts")
+        max_retries = max_retries if max_retries is not None else 3
+        
+        retry_delay = configManager.get_config("camera.buffer.retryDelay")
+        retry_delay = retry_delay if retry_delay is not None else 0.2
+        
+        for retry in range(max_retries):
+            try:
+                # 记录检测流程的开始时间
+                total_start_time = time.time()
+                
+                # 获取相机帧数据，带错误处理
+                frame_start_time = time.time()
+                success, depth_data, frame, camera_params = self._get_camera_frame_safe(camera, retry, configManager)
+                frame_time = (time.time() - frame_start_time) * 1000  # 转换为毫秒
+                
+                if not success or frame is None:
+                    if retry < max_retries - 1:
+                        logger.warning(f"第{attempt_num}次检测第{retry + 1}次取图失败，重试...")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        logger.error(f"第{attempt_num}次检测所有重试均失败")
+                        return None
+                
+                # 如果ROI启用，对图像进行ROI裁剪
+                enable_roi = configManager.get_config("roi.enable")
+                enable_roi = enable_roi if enable_roi is not None else False
+                if enable_roi:
+                    roi_config = self._get_roi_config()
+                frame = self._apply_roi_to_image(frame, roi_config)
+                        
+                        # 执行检测
+                detect_start_time = time.time()
+                results = detector.detect(frame)
+                detect_time = (time.time() - detect_start_time) * 1000  # 转换为毫秒
+                
+                # ROI过滤和2D结果处理
+                roi_start_time = time.time()
+                detection_count = 0
+                filtered_results_for_display = []
+                best_target_2d = None
+                
+                if results:
+                    # 获取图像尺寸
+                    image_height, image_width = frame.shape[:2]
+                    
+                    for result in results:
+                        if not (hasattr(result, 'pt1x') and hasattr(result, 'pt1y')):
+                            continue
+                        
+                        # 计算检测框中心点
+                        center_x = (result.pt1x + result.pt2x + result.pt3x + result.pt4x) / 4
+                        center_y = (result.pt1y + result.pt2y + result.pt3y + result.pt4y) / 4
+                        
+                        # ROI过滤（如果启用）
+                        if enable_roi:
+                            if not self._is_detection_in_roi_fast(center_x, center_y, image_width, image_height):
+                                continue
+                        
+                        detection_count += 1
+                        filtered_results_for_display.append(result)
+                        
+                        # 记录第一个有效目标作为最佳目标（简化版）
+                        if best_target_2d is None:
+                            best_target_2d = {
+                                'center': [center_x, center_y],
+                                'corners': [
+                                    [result.pt1x, result.pt1y],
+                                    [result.pt2x, result.pt2y],
+                                    [result.pt3x, result.pt3y],
+                                    [result.pt4x, result.pt4y]
+                                ],
+                                'result': result
+                            }
+                
+                roi_time = (time.time() - roi_start_time) * 1000  # 转换为毫秒
+                total_time = (time.time() - total_start_time) * 1000
+                
+                # 构造2D检测结果
+                detection_result = {
+                    'detection_count': detection_count,
+                    'best_target_2d': best_target_2d,
+                    'timing': {
+                        'frame_time': frame_time,
+                        'detect_time': detect_time,
+                        'roi_time': roi_time,
+                        'total_time': total_time
+                    },
+                    'raw_data': {
+                        'results': results,
+                        'depth_data': depth_data,
+                        'camera_params': camera_params,
+                        'frame': frame,
+                        'filtered_results': filtered_results_for_display
+                    }
+                }
+                
+                return detection_result
                 
             except Exception as e:
-                logger.error(f"执行catch时出错: {e}")
-                # 通过MQTT发送错误通知
-                self.initializer._notify_component_failure("catch_execution", f"catch执行失败: {str(e)} (客户端: {client_id})")
-                return "0,0.000,0.000,0.000,0.000"
+                if "buffer" in str(e).lower() or "magic word" in str(e).lower():
+                    logger.warning(f"第{attempt_num}次检测第{retry + 1}次遇到缓冲区错误: {str(e)}")
+                    if retry < max_retries - 1:
+                        # 缓冲区错误时，尝试清理缓冲区
+                        self._clear_camera_buffer(camera, configManager)
+                        time.sleep(retry_delay * 1.5)  # 缓冲区错误时等待更长时间
+                        continue
+                    else:
+                        logger.error(f"第{attempt_num}次检测第{retry + 1}次其他错误: {str(e)}")
+                    if retry < max_retries - 1:
+                        time.sleep(retry_delay / 2)  # 其他错误时等待较短时间
+                        continue
+                
+        return None
+
+    def _get_camera_frame_safe(self, camera, retry_count, configManager=None):
+        """
+        安全获取相机帧数据，处理缓冲区错误
+        
+        Args:
+            camera: 相机实例
+            retry_count: 重试次数
+            configManager: 配置管理器（可选）
+            
+        Returns:
+            tuple: (success, depth_data, frame, camera_params)
+        """
+        logger = self.initializer.logger
+        
+        try:
+            if retry_count == 0:
+                # 第一次尝试使用get_fresh_frame
+                return camera.get_fresh_frame()
+            else:
+                # 重试时使用普通的get_frame，避免缓冲区操作
+                return camera.get_frame()
                 
         except Exception as e:
-            logger.error(f"处理catch指令失败: {e}")
-            # 通过MQTT发送错误通知
-            self.initializer._notify_component_failure("catch_handler", f"catch指令处理失败: {str(e)} (客户端: {client_id})")
-            return "0,0.000,0.000,0.000,0.000"
+            if "buffer" in str(e).lower() or "magic word" in str(e).lower():
+                logger.warning(f"相机缓冲区错误: {str(e)}")
+                # 尝试清理缓冲区
+                self._clear_camera_buffer(camera, configManager)
+                return False, None, None, None
+            else:
+                logger.error(f"相机获取帧时出错: {str(e)}")
+                return False, None, None, None
+
+    def _clear_camera_buffer(self, camera, configManager=None):
+        """
+        清理相机缓冲区，尝试恢复正常状态
+        
+        Args:
+            camera: 相机实例
+            configManager: 配置管理器（可选）
+        """
+        logger = self.initializer.logger
+        
+        # 从配置获取清理参数
+        clear_attempts = 5
+        if configManager:
+            clear_attempts = configManager.get_config("camera.buffer.clearAttempts")
+            clear_attempts = clear_attempts if clear_attempts is not None else 5
+        
+        try:
+            # 尝试重新连接相机以清理缓冲区
+            if hasattr(camera, 'streaming_device') and camera.streaming_device:
+                old_timeout = camera.streaming_device.sock_stream.gettimeout()
+                # 设置很短的超时时间，快速清理缓冲区
+                camera.streaming_device.sock_stream.settimeout(0.01)
+                
+                # 尝试读取并丢弃缓冲区中的数据
+                for i in range(clear_attempts):
+                    try:
+                        camera.streaming_device.getFrame()
+                        logger.debug(f"清理缓冲区第{i+1}次")
+                    except:
+                        break
+                
+                # 恢复原始超时设置
+                camera.streaming_device.sock_stream.settimeout(old_timeout)
+                logger.debug("相机缓冲区清理完成")
+                
+        except Exception as e:
+            logger.debug(f"清理相机缓冲区时出错: {str(e)}")
+
+    def _perform_single_detection(self, camera, detector: RKNN_YOLO, configManager):
+        """
+        执行单次检测 - 优化版本，专注于核心检测性能
+        
+        Args:
+            camera: 相机实例
+            detector: 检测器实例
+            configManager: 配置管理器
+        
+        Returns:
+            dict: 检测结果字典
+        """
+        logger = self.initializer.logger
+        try:
+            # 记录整个检测流程的开始时间
+            total_start_time = time.time()
+            
+            # 步骤1: 获取相机帧数据 - 高性能版本
+            frame_start_time = time.time()
+            success, depth_data, frame, camera_params = camera.get_frame()
+            frame_time = (time.time() - frame_start_time) * 1000
+            
+            if not success or frame is None:
+                logger.error("无法获取有效的相机帧数据")
+                return None
+            
+            # 步骤2: 检查ROI配置（快速检查，不进行复杂计算）
+            roi_start_time = time.time()
+            enable_roi = configManager.get_config("roi.enable")
+            roi_config = None
+            
+            if enable_roi:
+                # 简化的ROI配置获取，只计算检测需要的参数
+                roi_settings = self._get_roi_config()
+                if roi_settings and roi_settings.get("enable"):
+                    img_height, img_width = frame.shape[:2]
+                    roi_width = roi_settings.get("width", 0)
+                    roi_height = roi_settings.get("height", 0)
+                    center_x_offset = roi_settings.get("centerXOffset", 0)
+                    center_y_offset = roi_settings.get("centerYOffset", 0)
+                    
+                    center_x = img_width // 2 + center_x_offset
+                    center_y = img_height // 2 + center_y_offset
+                    
+                    x1 = max(0, center_x - roi_width // 2)
+                    y1 = max(0, center_y - roi_height // 2)
+                    x2 = min(img_width, x1 + roi_width)
+                    y2 = min(img_height, y1 + roi_height)
+                    
+                    roi_config = {
+                        'enabled': True,
+                        'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
+                    }
+            
+            roi_time = (time.time() - roi_start_time) * 1000
+            
+            # 步骤3: 执行纯检测（不包含绘制和保存）
+            detect_start_time = time.time()
+            
+            # 使用优化的检测方法，只做检测和坐标转换
+            detection_results = detector.detect(frame)
+            detect_time = (time.time() - detect_start_time) * 1000
+            
+            # 步骤4: 坐标转换（如果有检测结果）
+            coord_start_time = time.time()
+            best_target = None
+            detection_count = 0
+            
+            if detection_results and depth_data and camera_params:
+                # 使用高性能坐标转换
+                best_target = detector.process_detection_to_coordinates_fast(
+                    detection_results, depth_data, camera_params, roi_config
+                )
+                
+                # 计算最终检测数量（考虑ROI过滤）
+                if roi_config and roi_config.get('enabled'):
+                    roi_x1, roi_y1 = roi_config['x1'], roi_config['y1']
+                    roi_x2, roi_y2 = roi_config['x2'], roi_config['y2']
+                    
+                    for result in detection_results:
+                        center_x = (result.pt1x + result.pt2x + result.pt3x + result.pt4x) * 0.25
+                        center_y = (result.pt1y + result.pt2y + result.pt3y + result.pt4y) * 0.25
+                        if roi_x1 <= center_x <= roi_x2 and roi_y1 <= center_y <= roi_y2:
+                            detection_count += 1
+                else:
+                    detection_count = len(detection_results)
+            
+            coord_time = (time.time() - coord_start_time) * 1000
+            
+            # 计算总耗时（只包含核心检测部分）
+            core_total_time = (time.time() - total_start_time) * 1000
+            
+            # 步骤5: 异步保存图像（如果启用）- 不计入检测耗时
+            save_start_time = time.time()
+            annotated_image = None
+            
+            # 检查是否需要绘制和保存图像
+            save_config = configManager.get_config("detection.saveImage")
+            if save_config and save_config.get("enabled", False):
+                try:
+                    # 创建带注释的图像用于保存，但不计入检测耗时
+                    annotated_image = detector._draw_detection_annotations(
+                        frame.copy(), detection_results, best_target, 
+                        detect_time, coord_time, core_total_time, roi_config
+                    )
+                    
+                    # 异步保存图像（不阻塞检测流程）
+                    import threading
+                    save_data = {
+                        'detection_count': detection_count,
+                        'best_target': best_target,
+                        'annotated_image': annotated_image
+                    }
+                    threading.Thread(
+                        target=self._save_detection_image_async,
+                        args=(save_data, "single_detection"),
+                        daemon=True
+                    ).start()
+                    
+                except Exception as e:
+                    logger.debug(f"图像处理失败: {e}")
+            
+            save_time = (time.time() - save_start_time) * 1000
+            
+            # 构造结果（只包含核心检测数据）
+            result = {
+                'detection_count': detection_count,
+                'best_target': best_target,
+                'annotated_image': annotated_image,  # 可能为None
+                'original_image': frame,
+                'timing': {
+                    'frame_time': frame_time,
+                    'roi_time': roi_time,
+                    'detect_time': detect_time,
+                    'coord_time': coord_time,
+                    'save_time': save_time,
+                    'total_time': core_total_time  # 只包含核心检测时间
+                }
+            }
+            
+            # 输出简化的耗时统计
+            logger.info(f"检测到{detection_count}个目标, 总耗时: {core_total_time:.1f}ms")
+            logger.info(f"详细耗时: 获取图像={frame_time:.1f}ms, 检测={detect_time:.1f}ms, "
+                       f"坐标转换={coord_time:.1f}ms, ROI计算={roi_time:.1f}ms")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"单次检测时出错: {str(e)}")
+            return None
+
+    def _save_detection_image_async(self, save_data: dict, client_id: str):
+        """
+        异步保存检测结果图像到SFTP，不阻塞主检测流程
+        
+        Args:
+            save_data: 包含检测结果和图像的字典
+            client_id: 客户端ID，用于文件命名
+        """
+        logger = self.initializer.logger
+        
+        try:
+            # 获取配置管理器
+            configManager = self.initializer.get_config_manager()
+            if not configManager:
+                return
+            
+            # 获取绘制好的图像
+            annotated_image = save_data.get('annotated_image')
+            if annotated_image is None:
+                return
+            
+            # 获取SFTP客户端
+            sftp_client = self.initializer.get_sftp_client()
+            if not sftp_client or not sftp_client.connected:
+                logger.debug("SFTP客户端未连接，跳过图像上传")
+                return
+            
+            # 生成文件前缀
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            client_safe = client_id.replace(":", "_").replace(".", "_")
+            
+            # 根据检测结果添加标识
+            best_target = save_data.get('best_target')
+            if best_target and best_target.get('robot_3d'):
+                result_tag = "SUCCESS"
+                x, y, z = best_target['robot_3d']
+                angle = best_target.get('angle', 0.0)
+                coord_info = f"_x{x:.1f}_y{y:.1f}_z{z:.1f}_a{angle:.1f}"
+            else:
+                result_tag = "NO_TARGET"
+                coord_info = ""
+            
+            # 构造文件前缀
+            prefix = f"detection_{timestamp}_{client_safe}_{result_tag}{coord_info}"
+            
+            # 获取远程路径配置
+            save_config = configManager.get_config("detection.saveImage")
+            remote_path = save_config.get("remote_path")
+            
+            # 使用SFTP客户端上传图像
+            result = sftp_client.upload_image(
+                image_data=annotated_image,
+                image_format="jpg",
+                prefix=prefix,
+                remote_path=remote_path
+            )
+            
+            if result["success"]:
+                logger.debug(f"检测图像异步上传成功: {result['filename']}")
+                
+                # 通过MQTT通知工控机图像更新
+                mqtt_client = self.initializer.get_mqtt_client()
+                if mqtt_client:
+                    from ClassModel.MqttResponse import MQTTResponse
+                    from SystemEnums.VisionCoreCommands import MessageType
+                    
+                    # 构造检测结果数据
+                    detection_data = {
+                        "filename": result["filename"],
+                        "remote_path": result["remote_path"],
+                        "file_size": result["file_size"],
+                        "detection_count": save_data.get('detection_count', 0),
+                        "client_id": client_id,
+                        "timestamp": timestamp,
+                        "image_type": "detection_result"
+                    }
+                    
+                    # 如果有检测目标，添加坐标信息
+                    if best_target and best_target.get('robot_3d'):
+                        x, y, z = best_target['robot_3d']
+                        angle = best_target.get('angle', 0.0)
+                        detection_data.update({
+                            "target_found": True,
+                            "coordinates": {
+                                "x": round(x, 3),
+                                "y": round(y, 3),
+                                "z": round(z, 3),
+                                "angle": round(angle, 3)
+                            }
+                        })
+                    else:
+                        detection_data["target_found"] = False
+                    
+                    # 发送MQTT通知
+                    response = MQTTResponse(
+                        command="detection_image_upload",
+                        component="detection",
+                        messageType=MessageType.SUCCESS,
+                        message=f"检测图像上传成功: {result['filename']}",
+                        data=detection_data
+                    )
+                    
+                    mqtt_client.send_mqtt_response(response)
+                    
+            else:
+                logger.warning(f"检测图像异步上传失败: {result['message']}")
+                
+        except Exception as e:
+            logger.warning(f"异步上传检测图像异常: {e}")
+
+    def _cleanup_old_images(self, save_dir: str, max_files: int):
+        """
+        清理旧的图像文件
+        
+        Args:
+            save_dir: 图像保存目录
+            max_files: 最大文件数量
+        """
+        try:
+            import os
+            import glob
+            
+            pattern = os.path.join(save_dir, "*.jpg")
+            files = glob.glob(pattern)
+            
+            if len(files) <= max_files:
+                return
+            
+            files.sort(key=os.path.getmtime)
+            files_to_delete = files[:-max_files]
+            
+            for file_path in files_to_delete:
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    self.initializer.logger.warning(f"删除文件失败 {file_path}: {e}")
+                    
+            if files_to_delete:
+                self.initializer.logger.info(f"清理了 {len(files_to_delete)} 个旧图像文件")
+                
+        except Exception as e:
+            self.initializer.logger.error(f"清理旧图像文件异常: {e}")
+
+    def _perform_2d_detection(self, camera, detector, configManager):
+        """
+        执行2D检测 - 已废弃，请使用_perform_single_detection
+        """
+        return self._perform_single_detection(camera, detector, configManager)
+
+    def _perform_3d_coordinate_calculation(self, detection_2d_result, camera, detector, configManager):
+        """
+        执行3D坐标计算 - 已废弃，请使用detector.detect_with_coordinates
+        """
+        logger = self.initializer.logger
+        logger.warning("_perform_3d_coordinate_calculation方法已废弃，请使用detector.detect_with_coordinates")
+        return None
+
+    def _check_detection_stability(self, current_result, previous_result):
+        """
+        检查检测稳定性 - 已废弃，单步模式下不需要
+        """
+        logger = self.initializer.logger
+        logger.warning("_check_detection_stability方法已废弃，单步模式下不需要稳定性检测")
+        return False
+
+    def _process_detection_to_coordinates_fast(self, results, depth_data, camera_params, detector):
+        """
+        处理检测结果到坐标 - 已废弃，请使用detector.process_detection_to_coordinates_fast
+        """
+        logger = self.initializer.logger
+        logger.warning("_process_detection_to_coordinates_fast方法已废弃，请使用detector.process_detection_to_coordinates_fast")
+        return None
+
+    def _is_detection_in_roi_fast(self, image_x: float, image_y: float, image_width: int, image_height: int) -> bool:
+        """
+        检查检测是否在ROI内 - 已废弃，ROI处理已集成到detector中
+        """
+        logger = self.initializer.logger
+        logger.warning("_is_detection_in_roi_fast方法已废弃，ROI处理已集成到detector中")
+        return True
     
     def handle_mqtt_message(self, mqtt_message):
         """
@@ -397,13 +1140,12 @@ class VisionCoreApp:
             self.initializer.logger.error(f"清理备份文件时出错: {e}")
     
     
-    
     def _restore_config_backup(self) -> bool:
         """恢复配置备份"""
         try:
             import os
             import shutil
-            if hasattr(self, 'latest_backup') and os.path.exists(self.latest_backup):
+            if os.path.exists(self.latest_backup):
                 shutil.copy2(self.latest_backup, self.config_path)
                 self.initializer.logger.info("配置文件已从备份恢复")
                 return True
@@ -1173,12 +1915,7 @@ class VisionCoreApp:
                         
                         # 解析结果
                         detection_count = 0
-                        if hasattr(self.initializer, '_parse_rknn_results'):
-                            detection_count = self.initializer._parse_rknn_results(results)
-                        elif hasattr(self.initializer, '_parse_yolo_results'):
-                            detection_count = self.initializer._parse_yolo_results(results)
-                        else:
-                            # 简单计数
+                        if results:
                             if isinstance(results, (list, tuple)):
                                 detection_count = len(results)
                             elif hasattr(results, '__len__'):
@@ -1329,16 +2066,106 @@ class VisionCoreApp:
                     logger.warning(f"系统健康检查: {healthy_components}/{total_components} 组件正常，不健康的组件: {', '.join(unhealthy)}")
                 # 如果所有组件正常，不记录日志（静默运行）
                 
-                # 如果TCP服务器运行正常，向客户端发送系统状态
-                tcp_server = self.initializer.get_tcp_server()
-                if tcp_server and tcp_server.is_connected and len(tcp_server.clients) > 0:
-                    status_msg = f"系统健康报告: {healthy_components}/{total_components} 组件正常"
-                    if unhealthy:
-                        status_msg += f", 不健康的组件: {', '.join(unhealthy)}"
-                    tcp_server.broadcast_message(status_msg)
+                # 注释掉TCP服务端主动广播健康状态的代码
+                # TCP服务端只应该在收到catch指令时回传检测数据，不能发送其他任何数据
+                # if tcp_server and tcp_server.is_connected and len(tcp_server.clients) > 0:
+                #     status_msg = f"系统健康报告: {healthy_components}/{total_components} 组件正常"
+                #     if unhealthy:
+                #         status_msg += f", 不健康的组件: {', '.join(unhealthy)}"
+                #     tcp_server.broadcast_message(status_msg)
                 
         except Exception as e:
             logger.error(f"健康检查异常: {e}")
+    
+    def _get_roi_config(self) -> dict:
+        """
+        获取ROI配置
+        
+        Returns:
+            dict: ROI配置信息
+        """
+        configManager = self.initializer.get_config_manager()
+        if not configManager:
+            return {}
+        
+        roi_config = {
+            "enable": configManager.get_config("roi.enable"),
+            "centerXOffset": configManager.get_config("roi.centerXOffset"),
+            "centerYOffset": configManager.get_config("roi.centerYOffset"),
+            "width": configManager.get_config("roi.width"),
+            "height": configManager.get_config("roi.height")
+        }
+        
+        # 确保ROI配置有效
+        if roi_config["enable"]:
+            if roi_config["centerXOffset"] < 0: roi_config["centerXOffset"] = 0
+            if roi_config["centerYOffset"] < 0: roi_config["centerYOffset"] = 0
+            if roi_config["width"] <= 0: roi_config["width"] = 1
+            if roi_config["height"] <= 0: roi_config["height"] = 1
+        
+        return roi_config
+    
+    def _apply_roi_to_image(self, image, roi_config: dict):
+        """
+        对图像应用ROI裁剪
+        
+        Args:
+            image: 输入图像
+            roi_config: ROI配置字典
+            
+        Returns:
+            np.ndarray: 裁剪后的图像
+        """
+        if not roi_config["enable"]:
+            return image
+        
+        # 获取图像尺寸
+        img_height, img_width = image.shape[:2]
+        
+        # 获取ROI参数
+        roi_width = roi_config.get("width", 0)
+        roi_height = roi_config.get("height", 0)
+        center_x_offset = roi_config.get("centerXOffset", 0)
+        center_y_offset = roi_config.get("centerYOffset", 0)
+        
+        # 计算ROI区域
+        center_x = img_width // 2 + center_x_offset
+        center_y = img_height // 2 + center_y_offset
+        
+        # 计算ROI边界
+        x1 = max(0, center_x - roi_width // 2)
+        y1 = max(0, center_y - roi_height // 2)
+        x2 = min(img_width, x1 + roi_width)
+        y2 = min(img_height, y1 + roi_height)
+        
+        # 确保ROI区域有效
+        if x2 <= x1 or y2 <= y1:
+            self.initializer.logger.warning("ROI区域无效，使用完整图像")
+            return image
+        
+        # 裁剪图像
+        cropped_image = image[y1:y2, x1:x2]
+        
+        self.initializer.logger.info(f"ROI裁剪完成: 原图尺寸 {img_width}x{img_height} -> ROI尺寸 {x2-x1}x{y2-y1}")
+        return cropped_image
+
+    def handle_tcp_client_disconnected(self, client_id: str, reason: str = ""):
+        """
+        处理TCP客户端断开连接，清理防抖数据
+        
+        Args:
+            client_id: 断开连接的客户端ID
+            reason: 断开连接的原因
+        """
+        logger = self.initializer.logger
+        
+        # 清理防抖相关数据
+        if client_id in self.last_tcp_command_time:
+            del self.last_tcp_command_time[client_id]
+        if client_id in self.tcp_processing_flags:
+            del self.tcp_processing_flags[client_id]
+        
+        logger.debug(f"已清理客户端 {client_id} 的防抖数据 (断开原因: {reason})")
 
 
 def main():

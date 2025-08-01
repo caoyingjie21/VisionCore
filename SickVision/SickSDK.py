@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import time
 import socket
+import logging
 
 class QtVisionSick:
     """
@@ -38,7 +39,9 @@ class QtVisionSick:
         self.deviceControl = None
         self.streaming_device = None
         self.is_connected = False
+        self.logger = logging.getLogger(__name__)
         self.camera_params = None  # 存储相机参数
+        self.use_single_step = True  # 默认使用单步模式，避免缓冲区问题
         
     def _check_camera_available(self):
         """
@@ -55,12 +58,16 @@ class QtVisionSick:
             sock.close()
             return result == 0
         except Exception as e:
+            self.logger.error(f"Error checking camera availability: {str(e)}")
             return False
     
     @retry(max_retries=3, delay=1.0, logger_name=__name__)
-    def connect(self):
+    def connect(self, use_single_step=True):
         """
         连接相机并初始化流
+        
+        Args:
+            use_single_step (bool): 是否使用单步模式，默认True避免缓冲区问题
             
         Returns:
             bool: 连接是否成功
@@ -70,6 +77,8 @@ class QtVisionSick:
         """
         if not self._check_camera_available():
             raise ConnectionError(f"Camera at {self.ipAddr}:{self.control_port} is not accessible")
+            
+        self.use_single_step = use_single_step
         
         # 创建设备控制实例
         self.deviceControl = Control(self.ipAddr, self.protocol, self.control_port)
@@ -79,23 +88,29 @@ class QtVisionSick:
         
         # 尝试登录 - 在连接时登录，保持登录状态
         try:
-            self.deviceControl.login(Control.USERLEVEL_SERVICE, '123456')
+            self.deviceControl.login(Control.USERLEVEL_SERVICE, 'CUST_SERV')
+            self.logger.info("以服务级别登录成功")
         except Exception as e:
+            self.logger.warning(f"Service level login failed, trying client level: {str(e)}")
             self.deviceControl.login(Control.USERLEVEL_AUTH_CLIENT, 'CLIENT')
+            self.logger.info("以客户端级别登录成功")
         
         # 获取设备信息
         name, version = self.deviceControl.getIdent()
+        self.logger.info(f"Connected to device: {name.decode('utf-8')}, version: {version.decode('utf-8')}")
         
         # 尝试设置较低的帧速率以减少延迟
         try:
             # 获取当前帧周期 (微秒)
             current_frame_period = self.deviceControl.getFramePeriodUs()
+            self.logger.info(f"当前帧周期: {current_frame_period} 微秒")
             
             # 设置较低的帧率 (例如 30 fps = 33333 微秒)
             self.deviceControl.setFramePeriodUs(33333)
             new_frame_period = self.deviceControl.getFramePeriodUs()
+            self.logger.info(f"设置新帧周期: {new_frame_period} 微秒")
         except Exception as e:
-            pass
+            self.logger.warning(f"设置帧率失败: {str(e)}")
         
         # 配置流设置
         streamingSettings = BlobClientConfig()
@@ -106,12 +121,19 @@ class QtVisionSick:
         self.streaming_device = Streaming(self.ipAddr, self.streaming_port)
         self.streaming_device.openStream()
         
-        # 启动连续流
-        self.deviceControl.startStream()
+        # 根据模式决定流的处理方式
+        if self.use_single_step:
+            self.logger.info("使用单步模式，先停止流并设置为单步模式")
+            # 确保流已停止
+            self.deviceControl.stopStream()
+        else:
+            self.logger.info("使用连续流模式，启动流")
+            self.deviceControl.startStream()
         
         self.is_connected = True
+        self.logger.info("Successfully connected to camera")
         return True
-    
+
     def get_camera_params(self):
         """
         获取相机参数
@@ -161,7 +183,35 @@ class QtVisionSick:
                 intensity_image (numpy.ndarray): 强度图
                 camera_params: 相机参数对象
         """
+        # 执行单步模式下的一次获取
+        if self.use_single_step:
+            try:
+                # 发送单步命令并获取帧
+                self.deviceControl.singleStep()
+                time.sleep(0.05)  # 等待相机响应
+            except Exception as e:
+                self.logger.warning(f"发送单步命令时出错: {str(e)}")
+        
         # 获取帧数据
+        return self._get_frame_data()
+
+    @require_connection
+    @retry(max_retries=2, delay=0.5, logger_name=__name__)        
+    def get_frame_no_step(self):
+        """
+        获取当前帧数据，不发送单步命令
+        
+        Returns:
+            tuple: (success, depth_data, intensity_image, camera_params)
+                success (bool): 是否成功获取数据
+                depth_data (list): 深度图数据
+                intensity_image (numpy.ndarray): 强度图
+                camera_params: 相机参数对象
+        """
+        # 获取帧数据，不发送单步命令
+        if not self.use_single_step:
+            raise ValueError("连续流模式下不能使用get_frame_no_step")
+        self.deviceControl.singleStep()
         return self._get_frame_data()
 
     @require_connection
@@ -172,6 +222,10 @@ class QtVisionSick:
         Returns:
             tuple: (success, depth_data, intensity_image, camera_params)
         """
+        if self.use_single_step:
+            # 单步模式下直接获取最新帧
+            return self.get_frame()
+        
         # 连续流模式下，执行一次额外读取来获取更新的帧
         try:
             # 备份当前socket超时设置
@@ -183,9 +237,10 @@ class QtVisionSick:
             try:
                 # 尝试读取一帧来获取更新的数据
                 self.streaming_device.getFrame()
+                self.logger.debug("已丢弃一个缓冲帧以获取更新数据")
             except socket.timeout:
                 # 超时是正常的，表示没有额外的缓冲数据
-                pass
+                self.logger.debug("没有额外缓冲帧，直接获取当前帧")
             
             # 恢复原始超时设置
             self.streaming_device.sock_stream.settimeout(old_timeout)
@@ -200,8 +255,93 @@ class QtVisionSick:
             except:
                 pass
                 
+            self.logger.error(f"获取较新帧时出错: {str(e)}")
             # 降级到普通获取方法
             return self.get_frame()
+
+    @require_connection
+    def get_latest_frame(self, flush_count=2):
+        """
+        获取最新的帧数据，清空缓冲区确保获取真正最新的帧
+        
+        Args:
+            flush_count (int): 清空缓冲区的帧数，默认为2
+            
+        Returns:
+            tuple: (success, depth_data, intensity_image, camera_params)
+                success (bool): 是否成功获取数据
+                depth_data (list): 深度图数据
+                intensity_image (numpy.ndarray): 强度图
+                camera_params: 相机参数对象
+        """
+        if self.use_single_step:
+            # 单步模式下直接获取最新帧
+            return self.get_frame()
+        
+        # 连续流模式下，使用安全的缓冲区清空策略
+        try:
+            # 备份当前socket超时设置
+            old_timeout = self.streaming_device.sock_stream.gettimeout()
+            
+            # 设置较短的超时时间来检测缓冲区状态
+            self.streaming_device.sock_stream.settimeout(0.05)  # 50ms超时
+            
+            frames_flushed = 0
+            # 安全地读取并丢弃旧帧
+            for i in range(flush_count):
+                try:
+                    # 完整读取一帧来保持数据包边界
+                    self.streaming_device.getFrame()
+                    frames_flushed += 1
+                    self.logger.debug(f"已丢弃第{frames_flushed}个缓冲帧")
+                    
+                except socket.timeout:
+                    # 超时表示缓冲区已空，这是正常情况
+                    self.logger.debug(f"缓冲区已清空，共丢弃{frames_flushed}帧")
+                    break
+                except Exception as e:
+                    # 其他异常，记录并退出
+                    self.logger.warning(f"清空缓冲区时遇到异常: {str(e)}")
+                    break
+            
+            # 恢复原始超时设置
+            self.streaming_device.sock_stream.settimeout(old_timeout)
+            
+            # 现在获取最新的帧
+            self.logger.debug("开始获取最新帧")
+            return self._get_frame_data()
+            
+        except Exception as e:
+            # 确保恢复超时设置
+            try:
+                self.streaming_device.sock_stream.settimeout(old_timeout)
+            except:
+                pass
+                
+            self.logger.error(f"获取最新帧时出错: {str(e)}")
+            # 降级到普通获取方法
+            return self.get_frame()
+
+    @require_connection    
+    def start_continuous_mode(self):
+        """
+        切换到连续模式并启动流
+        
+        Returns:
+            bool: 是否成功启动连续模式
+        """
+        try:
+            # 确保设备处于客户端级别登录状态
+            self.deviceControl.login(Control.USERLEVEL_AUTH_CLIENT, 'CLIENT')
+            
+            # 启动连续流
+            self.deviceControl.startStream()
+            self.use_single_step = False
+            self.logger.info("已切换到连续流模式")
+            return True
+        except Exception as e:
+            self.logger.error(f"启动连续模式失败: {str(e)}")
+            return False
             
     @safe_disconnect  
     def disconnect(self):
@@ -214,34 +354,49 @@ class QtVisionSick:
                     try:
                         self.deviceControl.login(Control.USERLEVEL_AUTH_CLIENT, 'CLIENT')
                     except Exception as e:
-                        pass
+                        self.logger.warning(f"登录设备时出错: {str(e)}")
                         
+                    # 如果处于单步模式，先确保停止单步获取
+                    if self.use_single_step:
+                        try:
+                            # 停止所有正在进行的单步操作
+                            self.deviceControl.stopStream()
+                            time.sleep(0.2)  # 等待相机处理命令
+                            self.logger.info("单步模式已停止")
+                        except Exception as e:
+                            self.logger.warning(f"停止单步模式时出错: {str(e)}")
+                    
                     # 停止数据流
                     self.deviceControl.stopStream()
                     time.sleep(0.2)  # 等待相机处理命令
+                    self.logger.info("数据流已停止")
                 except Exception as e:
-                    pass
+                    self.logger.warning(f"停止流时出错: {str(e)}")
                     
                 # 关闭流设备
                 if self.streaming_device:
                     try:
                         self.streaming_device.closeStream()
+                        self.logger.info("流连接已关闭")
                     except Exception as e:
-                        pass
+                        self.logger.warning(f"关闭流连接时出错: {str(e)}")
                     
                 # 登出设备
                 try:
                     self.deviceControl.logout()
+                    self.logger.info("设备已登出")
                 except Exception as e:
-                    pass
+                    self.logger.warning(f"登出设备时出错: {str(e)}")
                     
                 # 关闭控制连接
                 try:
                     self.deviceControl.close()
+                    self.logger.info("控制连接已关闭")
                 except Exception as e:
-                    pass
+                    self.logger.warning(f"关闭控制连接时出错: {str(e)}")
                     
             self.is_connected = False
+            self.logger.info("相机连接已完全断开")
     
     def __enter__(self):
         """上下文管理器入口"""
@@ -254,6 +409,7 @@ class QtVisionSick:
         
     def __del__(self):
         """确保在销毁时断开连接"""
+        self.logger.info("相机连接已销毁,释放资源")
         self.disconnect()
 
     
