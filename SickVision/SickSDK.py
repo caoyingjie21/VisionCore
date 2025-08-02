@@ -188,7 +188,7 @@ class QtVisionSick:
             try:
                 # 发送单步命令并获取帧
                 self.deviceControl.singleStep()
-                time.sleep(0.05)  # 等待相机响应
+                time.sleep(0.01)  # 等待相机响应
             except Exception as e:
                 self.logger.warning(f"发送单步命令时出错: {str(e)}")
         

@@ -40,7 +40,7 @@ class VisionCoreApp:
         # 防抖和性能监控（默认值，将从配置文件中读取）
         self.last_tcp_command_time = {}  # 记录每个客户端的最后命令时间
         self.tcp_processing_flags = {}   # 记录每个客户端的处理状态
-        self.tcp_debounce_time = 2.0     # 防抖时间间隔（秒）
+        self.tcp_debounce_time = 0.5     # 防抖时间间隔（秒）
         self.z_offset = 0.0              # Z坐标补偿值
         self.pixel_threshold = 5.0       # 稳定性检测像素阈值
     
@@ -66,7 +66,7 @@ class VisionCoreApp:
                     self._run_main_loop()
                     
                 except KeyboardInterrupt:
-                    print("\n接收到停止信号，正在优雅关闭...")
+                    print("\n接收到停止信号，正在关闭...")
                     self.running = False
                     self.restart_on_failure = False
                     break
@@ -185,7 +185,7 @@ class VisionCoreApp:
     
     def handle_catch(self, client_id: str, message: str):
         """
-        处理catch指令 - 单步模式下进行快速单次检测（优化版）
+        处理catch指令 - 单步模式下进行快速单次检测（高性能版）
         
         Args:
             client_id: 客户端ID
@@ -199,19 +199,16 @@ class VisionCoreApp:
         current_time = time.time()
         
         logger = self.initializer.logger
-        logger.info(f"收到catch指令来自客户端: {client_id}")
         
         try:
             # 防抖检查：检查是否在防抖时间内收到重复命令
             if client_id in self.last_tcp_command_time:
                 time_since_last_command = current_time - self.last_tcp_command_time[client_id]
                 if time_since_last_command < self.tcp_debounce_time:
-                    logger.debug(f"防抖: 忽略来自 {client_id} 的重复catch命令 (距离上次: {time_since_last_command*1000:.1f}ms)")
                     return "0,0.000,0.000,0.000,0.000"
             
             # 检查是否正在处理该客户端的命令
             if self.tcp_processing_flags.get(client_id, False):
-                logger.debug(f"防抖: 客户端 {client_id} 的命令正在处理中，忽略新命令")
                 return "0,0.000,0.000,0.000,0.000"
             
             # 记录命令时间和处理状态
@@ -223,55 +220,21 @@ class VisionCoreApp:
             detector = self.initializer.get_detector()
             configManager = self.initializer.get_config_manager()
             
-            # 检查组件是否可用
-            if not camera:
-                elapsed_time = (time.time() - process_start_time) * 1000
-                logger.warning(f"相机未就绪，向 {client_id} 发送默认数据 (耗时: {elapsed_time:.1f}ms)")
-                self.initializer._notify_component_failure("camera", f"相机未初始化或未连接 (客户端: {client_id})")
-                return "0,0.000,0.000,0.000,0.000"
-            
-            if not detector:
-                elapsed_time = (time.time() - process_start_time) * 1000
-                logger.warning(f"检测器未初始化，向 {client_id} 发送默认数据 (耗时: {elapsed_time:.1f}ms)")
-                self.initializer._notify_component_failure("detector", f"检测器未初始化 (客户端: {client_id})")
-                return "0,0.000,0.000,0.000,0.000"
-            
-            if not configManager:
-                elapsed_time = (time.time() - process_start_time) * 1000
-                logger.warning(f"配置管理器未初始化，向 {client_id} 发送默认数据 (耗时: {elapsed_time:.1f}ms)")
-                self.initializer._notify_component_failure("configManager", f"配置管理器未初始化 (客户端: {client_id})")
+            # 快速检查组件是否可用
+            if not camera or not detector or not configManager:
                 return "0,0.000,0.000,0.000,0.000"
 
             # 获取配置
-            enable_roi = configManager.get_config("roi.enable")
             enable_stability = configManager.get_config("stability.isEnabled")
-            
-            # 处理配置值的默认值
-            enable_roi = enable_roi if enable_roi is not None else False
             enable_stability = enable_stability if enable_stability is not None else False
             
-            # 记录相机模式信息
-            camera_mode = "单步模式" if camera.use_single_step else "连续流模式"
-            logger.info(f"相机模式: {camera_mode}")
-            
             # 执行检测（单步模式推荐使用单次检测）
-            detection_start_time = time.time()
             if enable_stability and not camera.use_single_step:
-                # 仅在连续流模式下才建议使用稳定性检测
-                logger.info("连续流模式下执行稳定性检测")
                 final_result = self._perform_stable_detection(client_id, camera, detector, configManager)
             else:
-                # 单步模式下或禁用稳定性检测时，执行单次检测
-                if camera.use_single_step:
-                    logger.info("单步模式: 执行快速单次检测（推荐）")
-                else:
-                    logger.info("稳定性检测已禁用: 执行单次检测")
                 final_result = self._perform_single_detection(camera, detector, configManager)
             
-            detection_time = (time.time() - detection_start_time) * 1000  # 转换为毫秒
-            
             # 构造并发送响应数据
-            response_start_time = time.time()
             if final_result:
                 detection_count = final_result.get('detection_count', 0)
                 best_target = final_result.get('best_target')
@@ -287,78 +250,29 @@ class VisionCoreApp:
                     # 构造数据格式：检测个数,x,y,z,angle
                     response_data = f"{detection_count},{x:.3f},{y:.3f},{z_compensated:.3f},{angle:.3f}"
                     
-                    # 计算总耗时和响应构造时间
+                    # 计算总耗时（简化版本）
                     total_time = (time.time() - process_start_time) * 1000
-                    response_time = (time.time() - response_start_time) * 1000
                     
-                    # 获取检测过程中的详细耗时信息
-                    timing_info = final_result.get('timing', {})
-                    frame_time = timing_info.get('frame_time', 0)
-                    roi_time = timing_info.get('roi_time', 0)
-                    model_detect_time = timing_info.get('detect_time', 0)
-                    coord_time = timing_info.get('coord_time', 0)
-                    save_time = timing_info.get('save_time', 0)
-                    
+                    # 简化的日志输出（仅关键信息）
                     logger.info(f"检测完成，发送坐标给 {client_id}: 检测个数={detection_count}, "
-                               f"X={x:.3f}, Y={y:.3f}, Z={z_compensated:.3f}, A={angle:.3f}")
-                    logger.info(f"详细耗时分析:")
-                    logger.info(f"  1. 获取图像: {frame_time:.1f}ms")
-                    logger.info(f"  2. ROI计算: {roi_time:.1f}ms")
-                    logger.info(f"  3. 模型检测: {model_detect_time:.1f}ms")
-                    logger.info(f"  4. 坐标转换: {coord_time:.1f}ms")
-                    logger.info(f"  5. 保存图像: {save_time:.1f}ms")
-                    logger.info(f"  6. 响应构造: {response_time:.1f}ms")
-                    logger.info(f"  总耗时: {total_time:.1f}ms")
+                               f"X={x:.3f}, Y={y:.3f}, Z={z_compensated:.3f}, A={angle:.3f} "
+                               f"(总耗时: {total_time:.1f}ms)")
                     
                     return response_data
                 else:
-                    # 没有有效目标或坐标转换失败，发送检测个数为0
-                    response_data = "0,0.000,0.000,0.000,0.000"
-                        
-                    # 计算总耗时和响应构造时间
+                    # 没有有效目标
                     total_time = (time.time() - process_start_time) * 1000
-                    response_time = (time.time() - response_start_time) * 1000
-                    
-                    # 获取检测过程中的详细耗时信息
-                    timing_info = final_result.get('timing', {})
-                    frame_time = timing_info.get('frame_time', 0)
-                    roi_time = timing_info.get('roi_time', 0)
-                    model_detect_time = timing_info.get('detect_time', 0)
-                    coord_time = timing_info.get('coord_time', 0)
-                    save_time = timing_info.get('save_time', 0)
-                        
-                    logger.info(f"检测完成，但没有有效目标，发送默认数据给 {client_id}")
-                    logger.info(f"详细耗时分析:")
-                    logger.info(f"  1. 获取图像: {frame_time:.1f}ms")
-                    logger.info(f"  2. ROI计算: {roi_time:.1f}ms")
-                    logger.info(f"  3. 模型检测: {model_detect_time:.1f}ms")
-                    logger.info(f"  4. 坐标转换: {coord_time:.1f}ms")
-                    logger.info(f"  5. 保存图像: {save_time:.1f}ms")
-                    logger.info(f"  6. 响应构造: {response_time:.1f}ms")
-                    logger.info(f"  总耗时: {total_time:.1f}ms")
-                    
-                    return response_data
+                    logger.info(f"检测完成，但没有有效目标，发送默认数据给 {client_id} (总耗时: {total_time:.1f}ms)")
+                    return "0,0.000,0.000,0.000,0.000"
             else:
-                # 检测失败，发送默认数据
-                response_data = "0,0.000,0.000,0.000,0.000"
-                    
-                # 计算总耗时和响应构造时间
+                # 检测失败
                 total_time = (time.time() - process_start_time) * 1000
-                response_time = (time.time() - response_start_time) * 1000
-                    
-                logger.error(f"检测失败，发送默认数据给 {client_id}")
-                logger.error(f"详细耗时分析:")
-                logger.error(f"  检测耗时: {detection_time:.1f}ms")
-                logger.error(f"  响应构造: {response_time:.1f}ms")
-                logger.error(f"  总耗时: {total_time:.1f}ms")
-                
-                return response_data
+                logger.warning(f"检测失败，发送默认数据给 {client_id} (总耗时: {total_time:.1f}ms)")
+                return "0,0.000,0.000,0.000,0.000"
                         
         except Exception as e:
             total_time = (time.time() - process_start_time) * 1000
-            logger.error(f"处理 {client_id} 的catch命令时出错: {str(e)} (总耗时: {total_time:.1f}ms)", exc_info=True)
-            # 通过MQTT发送错误通知
-            self.initializer._notify_component_failure("catch_execution", f"catch执行失败: {str(e)} (客户端: {client_id})")
+            logger.error(f"处理 {client_id} 的catch命令时出错: {str(e)} (总耗时: {total_time:.1f}ms)")
             return "0,0.000,0.000,0.000,0.000"
         finally:
             # 清除处理标志，允许后续命令处理
@@ -395,21 +309,18 @@ class VisionCoreApp:
             try:
                 # 在检测之间添加配置的延迟，确保相机缓冲区稳定
                 if attempt > 0:
-                    logger.debug(f"等待相机稳定，准备第{attempt + 1}次检测")
                     time.sleep(stabilize_delay)
                 
                 # 执行2D检测（带重试机制）
                 detection_result = self._perform_2d_detection_with_retry(camera, detector, configManager, attempt + 1)
                 
                 if detection_result is None:
-                    logger.warning(f"第{attempt + 1}次检测失败")
                     continue
                         
                 detection_results.append(detection_result)
                 
                 # 如果是第一次检测，记录结果并继续
                 if attempt == 0:
-                    logger.debug(f"第{attempt + 1}次检测完成，检测到{detection_result.get('detection_count', 0)}个目标")
                     continue
                 
                 # 从第二次开始检查稳定性
@@ -420,13 +331,11 @@ class VisionCoreApp:
                 is_stable = self._check_detection_stability(current_result, previous_result)
                 
                 if is_stable:
-                    logger.info(f"第{attempt + 1}次检测：结果稳定，开始3D坐标计算")
+                    logger.info(f"检测稳定，开始3D坐标计算")
                     # 检测稳定后，进行3D坐标转换
                     final_result = self._perform_3d_coordinate_calculation(current_result, camera, detector, configManager)
                     last_stable_result = final_result
                     break
-                else:
-                    logger.debug(f"第{attempt + 1}次检测：结果不稳定，继续检测")
                     
             except Exception as e:
                 logger.error(f"第{attempt + 1}次稳定性检测时出错: {str(e)}")
@@ -474,11 +383,10 @@ class VisionCoreApp:
                 
                 if not success or frame is None:
                     if retry < max_retries - 1:
-                        logger.warning(f"第{attempt_num}次检测第{retry + 1}次取图失败，重试...")
                         time.sleep(retry_delay)
                         continue
                     else:
-                        logger.error(f"第{attempt_num}次检测所有重试均失败")
+                        logger.error(f"检测所有重试均失败")
                         return None
                 
                 # 如果ROI启用，对图像进行ROI裁剪
@@ -591,8 +499,8 @@ class VisionCoreApp:
                 # 第一次尝试使用get_fresh_frame
                 return camera.get_fresh_frame()
             else:
-                # 重试时使用普通的get_frame，避免缓冲区操作
-                return camera.get_frame()
+                # 重试时也使用get_fresh_frame，保持性能一致
+                return camera.get_fresh_frame()
                 
         except Exception as e:
             if "buffer" in str(e).lower() or "magic word" in str(e).lower():
@@ -661,7 +569,7 @@ class VisionCoreApp:
             
             # 步骤1: 获取相机帧数据 - 高性能版本
             frame_start_time = time.time()
-            success, depth_data, frame, camera_params = camera.get_frame()
+            success, depth_data, frame, camera_params = camera.get_fresh_frame()
             frame_time = (time.time() - frame_start_time) * 1000
             
             if not success or frame is None:
@@ -701,7 +609,6 @@ class VisionCoreApp:
             # 步骤3: 执行纯检测（不包含绘制和保存）
             detect_start_time = time.time()
             
-            # 使用优化的检测方法，只做检测和坐标转换
             detection_results = detector.detect(frame)
             detect_time = (time.time() - detect_start_time) * 1000
             
@@ -782,10 +689,10 @@ class VisionCoreApp:
                 }
             }
             
-            # 输出简化的耗时统计
-            logger.info(f"检测到{detection_count}个目标, 总耗时: {core_total_time:.1f}ms")
-            logger.info(f"详细耗时: 获取图像={frame_time:.1f}ms, 检测={detect_time:.1f}ms, "
-                       f"坐标转换={coord_time:.1f}ms, ROI计算={roi_time:.1f}ms")
+            # 简洁的日志输出
+            logger.info(f"检测到{detection_count}个目标, 总耗时: {core_total_time:.1f}ms "
+                       f"(获取图像={frame_time:.1f}ms, 检测={detect_time:.1f}ms, "
+                       f"坐标转换={coord_time:.1f}ms, ROI计算={roi_time:.1f}ms)")
             
             return result
             
@@ -936,20 +843,6 @@ class VisionCoreApp:
                 
         except Exception as e:
             self.initializer.logger.error(f"清理旧图像文件异常: {e}")
-
-    def _perform_2d_detection(self, camera, detector, configManager):
-        """
-        执行2D检测 - 已废弃，请使用_perform_single_detection
-        """
-        return self._perform_single_detection(camera, detector, configManager)
-
-    def _perform_3d_coordinate_calculation(self, detection_2d_result, camera, detector, configManager):
-        """
-        执行3D坐标计算 - 已废弃，请使用detector.detect_with_coordinates
-        """
-        logger = self.initializer.logger
-        logger.warning("_perform_3d_coordinate_calculation方法已废弃，请使用detector.detect_with_coordinates")
-        return None
 
     def _check_detection_stability(self, current_result, previous_result):
         """
@@ -1286,16 +1179,36 @@ class VisionCoreApp:
     
     def _reload_tcp_server(self) -> bool:
         """重启TCP服务器以应用新配置"""
+        logger = self.initializer.logger
         try:
-            if self.initializer._restart_tcp_server():
-                # 重新设置回调
-                tcp_server = self.initializer.get_tcp_server()
-                if tcp_server:
-                    message_handler = self.initializer.create_tcp_message_handler(self.handle_catch)
-                    tcp_server.set_message_callback(message_handler)
-                return True
+            logger.info("开始重新加载TCP服务器配置...")
+            
+            # 尝试重启TCP服务器，使用SystemInitializer的重启方法（已包含端口检查）
+            max_retries = 2  # 减少重试次数，因为SystemInitializer已经有完善的错误处理
+            for attempt in range(max_retries):
+                logger.info(f"尝试重启TCP服务器 (第{attempt + 1}次)")
+                
+                if self.initializer._restart_tcp_server():
+                    # 重新设置回调
+                    tcp_server = self.initializer.get_tcp_server()
+                    if tcp_server:
+                        message_handler = self.initializer.create_tcp_message_handler(self.handle_catch)
+                        tcp_server.set_message_callback(message_handler)
+                        tcp_server.set_disconnect_callback(self.handle_tcp_client_disconnected)
+                        logger.info("TCP服务器配置重新加载成功")
+                        return True
+                else:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"第{attempt + 1}次重启失败，等待3秒后重试...")
+                        import time
+                        time.sleep(3.0)  # 等待更长时间再重试
+                    else:
+                        logger.error("TCP服务器重启失败，已达到最大重试次数")
+            
             return False
-        except Exception:
+            
+        except Exception as e:
+            logger.error(f"重新加载TCP服务器配置时出现异常: {e}")
             return False
     
     def _reload_mqtt_client(self) -> bool:

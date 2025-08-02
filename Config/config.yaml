@@ -57,7 +57,7 @@ model:
   selectedModel: seasoning256.pt
 mqtt:
   connection:
-    broker_host: 192.168.2.15
+    broker_host: 127.0.0.1
     broker_port: 1883
     client_id: sickvision_headless
     keepalive: 60
@@ -110,7 +110,7 @@ stability:
   isEnabled: false             # 单步模式下禁用稳定性检测
   pixelThreshold: 5.0          # 稳定性检测的像素阈值（单步模式下不使用）
   debounceTime: 2.0            # TCP防抖时间（秒）
-  zOffset: -10               # Z坐标补偿值
+  zOffset: -10.0              # Z坐标补偿值
 system:
   debug: false
   log_level: INFO

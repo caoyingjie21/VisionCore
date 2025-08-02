@@ -832,7 +832,7 @@ class SystemInitializer:
             from Rknn.RknnYolo import RKNN_YOLO
             detector = RKNN_YOLO(
                 model_path=model_path,
-                conf_threshold=0.7,
+                conf_threshold=0.5,
                 nms_threshold=0.45
             )
             
@@ -894,24 +894,11 @@ class SystemInitializer:
                 print("开始模型预热（多次推理以充分预热）...")
             
             # 进行多次预热推理以确保模型完全预热
-            warmup_rounds = 1  # 进行5次预热
+            warmup_rounds = 2  # 进行5次预热
             try:
                 for i in range(warmup_rounds):
-                    if self.logger:
-                        self.logger.debug(f"执行第{i+1}次预热推理...")
-                    else:
-                        print(f"执行第{i+1}次预热推理...")
-                    
-                    start_time = time.time()
                     _ = detector.detect(test_input)
-                    end_time = time.time()
                     
-                    warmup_time = (end_time - start_time) * 1000
-                    if self.logger:
-                        self.logger.debug(f"第{i+1}次预热耗时: {warmup_time:.1f}ms")
-                    else:
-                        print(f"第{i+1}次预热耗时: {warmup_time:.1f}ms")
-                
                 if self.logger:
                     self.logger.info(f"模型预热完成，共执行{warmup_rounds}次推理")
                 else:

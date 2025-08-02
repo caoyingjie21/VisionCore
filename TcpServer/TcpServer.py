@@ -130,8 +130,31 @@ class TcpServer:
             
             # 关闭服务器套接字
             if self.server_socket:
+                try:
+                    self.server_socket.shutdown(socket.SHUT_RDWR)
+                except:
+                    pass  # 套接字可能已经关闭
                 self.server_socket.close()
                 self.server_socket = None
+            
+            # 等待线程结束（最多等待2秒）
+            threads_to_wait = []
+            if hasattr(self, 'accept_thread') and self.accept_thread and self.accept_thread.is_alive():
+                threads_to_wait.append(self.accept_thread)
+            if hasattr(self, 'heartbeat_thread') and self.heartbeat_thread and self.heartbeat_thread.is_alive():
+                threads_to_wait.append(self.heartbeat_thread)
+            if hasattr(self, 'cleanup_thread') and self.cleanup_thread and self.cleanup_thread.is_alive():
+                threads_to_wait.append(self.cleanup_thread)
+            
+            for thread in threads_to_wait:
+                try:
+                    thread.join(timeout=0.5)  # 每个线程最多等待0.5秒
+                except:
+                    pass
+            
+            # 清理状态
+            self.clients.clear()
+            self.stats = {"start_time": None, "connections": 0, "messages": 0}
             
             self.logger.info("TCP服务器已停止")
             
