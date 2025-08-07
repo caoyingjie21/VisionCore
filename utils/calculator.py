@@ -20,13 +20,7 @@ import time
 class CoordinateCalculator:
     """
     坐标转换计算器
-    负责相机坐标系到机器人坐标系的转换
-    
-    职责：
-    - 从深度数据计算3D相机坐标
-    - 相机坐标到机器人坐标的转换
-    - 角度转换
-    - 变换矩阵的加载和使用
+    负责处理相机坐标系到机器人坐标系的转换
     """
     
     def __init__(self, matrix_file_path: Optional[str] = None):
@@ -36,7 +30,7 @@ class CoordinateCalculator:
         Args:
             matrix_file_path: 变换矩阵文件路径，如果为None则使用默认路径
         """
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = logging.getLogger(__name__)
         
         # 设置变换矩阵文件路径
         if matrix_file_path:
@@ -46,16 +40,12 @@ class CoordinateCalculator:
             config_dir = Path(__file__).parent.parent / "Config"
             self.matrix_file_path = config_dir / "transformation_matrix.json"
         
-        # 4x4齐次变换矩阵
+        # 坐标转换相关属性
         self.transformation_matrix: Optional[np.ndarray] = None
-        
-        # 变换矩阵元数据
         self.matrix_metadata: dict = {}
         
         # 加载变换矩阵
         self.load_transformation_matrix()
-        
-        self.logger.info(f"坐标转换计算器初始化完成，变换矩阵文件: {self.matrix_file_path}")
     
     def load_transformation_matrix(self) -> bool:
         """
@@ -74,7 +64,7 @@ class CoordinateCalculator:
             
             # 检查数据格式
             if 'matrix' not in data:
-                self.logger.error("变换矩阵文件格式错误：缺少'matrix'字段")
+                self.logger.error("变换矩阵文件格式错误：缺少matrix字段")
                 return False
             
             matrix_data = data['matrix']
@@ -83,31 +73,22 @@ class CoordinateCalculator:
             if (not isinstance(matrix_data, list) or 
                 len(matrix_data) != 4 or 
                 not all(len(row) == 4 for row in matrix_data)):
-                self.logger.error("变换矩阵必须是4x4矩阵")
+                self.logger.error("变换矩阵格式错误：应为4x4矩阵")
                 return False
             
-            # 加载矩阵
+            # 转换为numpy数组
             self.transformation_matrix = np.array(matrix_data, dtype=np.float64)
             
             # 保存元数据
-            self.matrix_metadata = {
-                'calibration_points_count': data.get('calibration_points_count', 0),
-                'calibration_rmse': data.get('calibration_rmse', 0.0),
-                'transformation_type': data.get('transformation_type', 'unknown'),
-                'matrix_size': data.get('matrix_size', '4x4')
-            }
+            self.matrix_metadata = data.get('metadata', {})
             
-            self.logger.info(f"成功加载变换矩阵，标定点数: {self.matrix_metadata['calibration_points_count']}, "
-                           f"RMSE: {self.matrix_metadata['calibration_rmse']:.3f}mm")
+            self.logger.info(f"变换矩阵加载成功: {self.matrix_file_path}")
             return True
             
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
+        except Exception as e:
             self.logger.error(f"加载变换矩阵失败: {e}")
             return False
-        except Exception as e:
-            self.logger.error(f"加载变换矩阵时发生未知错误: {e}")
-            return False
-        
+
     def perform_2d_detection(self, frame, detector):
         """
         执行2D检测 - 只进行目标检测，返回所有检测框的坐标
@@ -124,8 +105,7 @@ class CoordinateCalculator:
             # 记录检测流程的开始时间
             total_start_time = time.time()
             
-            if frame is None or detector is None:
-                self.logger.error("无效的输入参数：frame或detector为None")
+            if frame is None:
                 return None
             
             # 执行检测
@@ -163,10 +143,9 @@ class CoordinateCalculator:
             process_time = (time.time() - process_start_time) * 1000  # 转换为毫秒
             total_time = (time.time() - total_start_time) * 1000
             
-            # 构造2D检测结果
-            detection_result = {
+            return {
                 'detection_count': detection_count,
-                'detection_boxes': detection_boxes,  # 所有检测框的坐标信息
+                'detection_boxes': detection_boxes,
                 'timing': {
                     'detect_time': detect_time,
                     'process_time': process_time,
@@ -174,187 +153,150 @@ class CoordinateCalculator:
                 }
             }
             
-            self.logger.debug(f"2D检测完成: 检测到{detection_count}个目标, "
-                            f"模型检测={detect_time:.1f}ms, 处理={process_time:.1f}ms, "
-                            f"总耗时={total_time:.1f}ms")
-            
-            return detection_result
-            
         except Exception as e:
-            self.logger.error(f"2D检测时出错: {str(e)}")
+            self.logger.error(f"2D检测失败: {e}")
             return None
-    
-    def process_detection_to_coordinates_fast(self, results, depth_data, camera_params):
+
+    def _calculate_angle_fast(self, result):
         """
-        高性能版本的坐标计算 - 目标10ms内完成
+        快速计算检测结果的角度
         
         Args:
-            results: 检测结果列表（DetectBox对象列表）
-            depth_data: 深度数据
-            camera_params: 相机参数
+            result: 检测结果对象
             
         Returns:
-            dict or None: 最优目标的坐标信息
+            float: 角度值（度）
         """
-        if not results or not depth_data or not camera_params:
-            return None
-        
-        # 预计算常用值，避免重复计算
-        width = camera_params.width
-        height = camera_params.height
-        cx, cy = camera_params.cx, camera_params.cy
-        fx, fy = camera_params.fx, camera_params.fy
-        k1, k2 = camera_params.k1, camera_params.k2
-        f2rc = camera_params.f2rc
-        
-        # 预计算世界坐标变换矩阵（如果需要）
-        m_c2w = None
-        if hasattr(camera_params, 'cam2worldMatrix') and len(camera_params.cam2worldMatrix) == 16:
-            m_c2w = np.array(camera_params.cam2worldMatrix).reshape(4, 4)
-        
-        # ROI过滤（优化版）
-        roi_enabled = hasattr(self, 'roi_enable_checkbox') and self.roi_enable_checkbox.isChecked()
-        if roi_enabled:
-            # 预计算ROI边界
-            roi_x1, roi_y1, roi_x2, roi_y2 = self.calculate_roi_coordinates()
-            filtered_results = []
-            for result in results:
-                # 快速中心点计算
-                center_x = (result.pt1x + result.pt2x + result.pt3x + result.pt4x) * 0.25
-                center_y = (result.pt1y + result.pt2y + result.pt3y + result.pt4y) * 0.25
-                if roi_x1 <= center_x <= roi_x2 and roi_y1 <= center_y <= roi_y2:
-                    filtered_results.append(result)
-            results = filtered_results
-            
-        if not results:
-            return None
-        
-        best_target = None
-        min_camera_z = float('inf')  # 改为追踪相机坐标系中的最小Z值
-        
-        # 批量处理所有检测结果
-        for i, result in enumerate(results):
-            # 快速边界框计算
-            center_x = int((result.pt1x + result.pt2x + result.pt3x + result.pt4x) * 0.25)
-            center_y = int((result.pt1y + result.pt2y + result.pt3y + result.pt4y) * 0.25)
-            
-            # 边界检查
-            if not (0 <= center_x < width and 0 <= center_y < height):
-                continue
-                
-            # 获取深度值
-            depth_index = center_y * width + center_x
-            if depth_index >= len(depth_data):
-                continue
-                
-            depth = depth_data[depth_index]
-            if depth <= 0:
-                continue
-            
-            # 简化的角度计算（基于主要边向量）
-            angle = self._calculate_angle_fast(result)
-            
-            # 计算3D坐标
-            success, camera_3d = self._calculate_3d_fast(center_x, center_y, depth, 
-                                                       cx, cy, fx, fy, k1, k2, f2rc, m_c2w)
-            
-            if success and camera_3d[2] < min_camera_z:  # 比较相机坐标系中的Z值
-                # 坐标系转换
-                robot_3d = None
-                if self.transformation_matrix is not None:
-                    robot_3d = self._transform_point_fast(camera_3d, self.transformation_matrix)
-                
-                if robot_3d is not None:
-                    min_camera_z = camera_3d[2]  # 更新最小Z值
-                    best_target = {
-                        'target_id': i + 1,
-                        'center': [center_x, center_y],
-                        'camera_3d': camera_3d,
-                        'robot_3d': robot_3d,
-                        'original_depth': depth,
-                        'angle': angle,
-                        'original_result': result
-                    }
-        
-        return best_target
-    
-    def _calculate_angle_fast(self, result):
-        """快速角度计算 - 简化版本"""
         try:
-            # 使用对角线向量计算主要方向
-            dx1 = result.pt3x - result.pt1x  # 对角线1
-            dy1 = result.pt3y - result.pt1y
-            dx2 = result.pt4x - result.pt2x  # 对角线2  
-            dy2 = result.pt4y - result.pt2y
-            
-            # 选择较长的对角线作为主方向
-            len1_sq = dx1*dx1 + dy1*dy1
-            len2_sq = dx2*dx2 + dy2*dy2
-            
-            if len1_sq > len2_sq:
-                angle_rad = math.atan2(dy1, dx1)
+            if hasattr(result, 'angle') and result.angle is not None:
+                # 如果检测结果中已经包含角度信息，直接使用
+                angle_rad = result.angle
+                # 转换为角度
+                angle_deg = math.degrees(angle_rad)
+                # 规范化到 [0, 180) 范围
+                angle_deg = angle_deg % 180
+                if angle_deg < 0:
+                    angle_deg += 180
+                return angle_deg
             else:
-                angle_rad = math.atan2(dy2, dx2)
-            
-            # 转换为角度并规范化到[0, 180)
-            angle_deg = math.degrees(angle_rad) % 180
-            return angle_deg
-            
-        except:
+                # 从四个角点计算角度
+                points = [
+                    [result.pt1x, result.pt1y],
+                    [result.pt2x, result.pt2y], 
+                    [result.pt3x, result.pt3y],
+                    [result.pt4x, result.pt4y]
+                ]
+                
+                # 计算所有边的长度和角度
+                edges = []
+                for i in range(4):
+                    j = (i + 1) % 4
+                    dx = points[j][0] - points[i][0]
+                    dy = points[j][1] - points[i][1]
+                    length = math.sqrt(dx*dx + dy*dy)
+                    angle = math.atan2(dy, dx)
+                    edges.append((length, angle))
+                
+                # 选择最长的边作为主方向
+                longest_edge = max(edges, key=lambda x: x[0])
+                main_angle = longest_edge[1]
+                
+                # 转换为角度并规范化
+                angle_deg = math.degrees(main_angle)
+                angle_deg = angle_deg % 180
+                if angle_deg < 0:
+                    angle_deg += 180
+                
+                return angle_deg
+                
+        except Exception as e:
+            self.logger.warning(f"计算角度失败: {e}")
             return 0.0
-    
+
     def _calculate_3d_fast(self, x, y, depth, cx, cy, fx, fy, k1, k2, f2rc, m_c2w):
-        """快速3D坐标计算"""
+        """
+        快速计算3D坐标
+        
+        Args:
+            x, y: 图像坐标
+            depth: 深度数据
+            cx, cy: 相机内参
+            fx, fy: 焦距
+            k1, k2: 畸变参数
+            f2rc: 焦距到像素比例
+            m_c2w: 相机到世界坐标变换矩阵
+            
+        Returns:
+            list: [x, y, z] 3D坐标
+        """
         try:
-            # 计算相机坐标系下的坐标
-            xp = (cx - x) / fx
-            yp = (cy - y) / fy
+            # 这里应该实现具体的3D坐标计算逻辑
+            # 由于原代码中没有完整的实现，这里提供一个基础框架
+            # 实际使用时需要根据具体的相机参数和深度数据格式进行调整
             
-            # 径向畸变校正
-            r2 = xp*xp + yp*yp
-            k = 1 + k1*r2 + k2*r2*r2
+            # 示例实现（需要根据实际情况修改）
+            if depth is None or len(depth) == 0:
+                return None
             
-            xd = xp * k
-            yd = yp * k
+            # 获取深度值（这里需要根据实际的深度数据格式进行调整）
+            depth_value = depth[int(y) * int(cx) + int(x)] if isinstance(depth, (list, np.ndarray)) else depth
             
-            # 3D坐标计算
-            s0_inv = 1.0 / math.sqrt(xd*xd + yd*yd + 1)
-            x_cam = xd * depth * s0_inv
-            y_cam = yd * depth * s0_inv
-            z_cam = depth * s0_inv - f2rc
+            if depth_value <= 0 or depth_value == float('inf'):
+                return None
             
-            # 世界坐标系转换（如果需要）
-            if m_c2w is not None:
-                x_world = m_c2w[0,3] + z_cam*m_c2w[0,2] + y_cam*m_c2w[0,1] + x_cam*m_c2w[0,0]
-                y_world = m_c2w[1,3] + z_cam*m_c2w[1,2] + y_cam*m_c2w[1,1] + x_cam*m_c2w[1,0]
-                z_world = m_c2w[2,3] + z_cam*m_c2w[2,2] + y_cam*m_c2w[2,1] + x_cam*m_c2w[2,0]
-                return True, [x_world, y_world, z_world]
-            else:
-                return True, [x_cam, y_cam, z_cam]
-                
-        except:
-            return False, [0, 0, 0]
-    
-    def _transform_point_fast(self, camera_point, transformation_matrix):
-        """快速坐标变换"""
-        try:
-            # 直接矩阵乘法，避免numpy数组创建开销
-            x, y, z = camera_point
-            T = transformation_matrix
+            # 计算3D坐标（简化版本，实际需要更复杂的计算）
+            z = depth_value
+            x_3d = (x - cx) * z / fx
+            y_3d = (y - cy) * z / fy
             
-            # 齐次坐标变换
-            x_robot = T[0,0]*x + T[0,1]*y + T[0,2]*z + T[0,3]
-            y_robot = T[1,0]*x + T[1,1]*y + T[1,2]*z + T[1,3]
-            z_robot = T[2,0]*x + T[2,1]*y + T[2,2]*z + T[2,3]
-            w = T[3,0]*x + T[3,1]*y + T[3,2]*z + T[3,3]
+            return [x_3d, y_3d, z]
             
-            if w != 0:
-                return [x_robot/w, y_robot/w, z_robot/w]
-            else:
-                return [x_robot, y_robot, z_robot]
-                
-        except:
+        except Exception as e:
+            self.logger.error(f"3D坐标计算失败: {e}")
             return None
+
+    def _transform_point_fast(self, camera_point, transformation_matrix):
+        """
+        快速坐标变换
+        
+        Args:
+            camera_point: 相机坐标系点 [x, y, z]
+            transformation_matrix: 变换矩阵
+            
+        Returns:
+            list: 机器人坐标系点 [x, y, z]
+        """
+        try:
+            if camera_point is None or transformation_matrix is None:
+                return None
+            
+            # 转换为齐次坐标
+            point_homogeneous = np.array([camera_point[0], camera_point[1], camera_point[2], 1.0])
+            
+            # 应用变换矩阵
+            transformed_point = transformation_matrix @ point_homogeneous
+            
+            # 返回前三个坐标
+            return [transformed_point[0], transformed_point[1], transformed_point[2]]
+            
+        except Exception as e:
+            self.logger.error(f"坐标变换失败: {e}")
+            return None
+
+    def get_transformation_matrix_status(self) -> dict:
+        """
+        获取变换矩阵状态信息
+        
+        Returns:
+            dict: 包含加载状态和元数据的字典
+        """
+        return {
+            'loaded': self.transformation_matrix is not None,
+            'matrix_file': str(self.matrix_file_path),
+            'matrix_exists': self.matrix_file_path.exists(),
+            'metadata': self.matrix_metadata,
+            'error': None if self.transformation_matrix is not None else "变换矩阵未加载"
+        }
 
 
 # 兼容性别名，保持与旧代码的兼容

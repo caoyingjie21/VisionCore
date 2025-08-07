@@ -762,6 +762,211 @@ class RKNN_YOLO:
         except:
             return None
     
+    def detect_calibration(self, image, depth_data, camera_params):
+        """
+        标定专用检测方法 - 绘制目标框体和角度，返回中心点相机坐标系坐标
+        
+        Args:
+            image (numpy.ndarray): 输入图像，BGR或灰度格式
+            depth_data (list): 深度数据
+            camera_params: 相机参数对象
+            
+        Returns:
+            tuple: (annotated_image, detection_coordinates)
+                - annotated_image: 绘制了检测框和角度的图像
+                - detection_coordinates: 检测到的目标坐标信息列表
+        """
+        try:
+            # 执行目标检测
+            detection_results = self.detect(image)
+            
+            if not detection_results:
+                # 没有检测到目标，返回原图像和空坐标列表
+                return image.copy(), []
+            
+            # 创建绘制图像（确保是BGR格式）
+            if len(image.shape) == 2:  # 灰度图像
+                annotated_image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+            else:
+                annotated_image = image.copy()
+            
+            # 检测结果坐标信息列表
+            detection_coordinates = []
+            
+            # 设置绘制参数
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
+            
+            # 遍历每个检测结果
+            for i, box in enumerate(detection_results):
+                target_id = i + 1
+                
+                # 绘制检测框（四边形）
+                pts = np.array([[box.pt1x, box.pt1y], [box.pt2x, box.pt2y], 
+                               [box.pt3x, box.pt3y], [box.pt4x, box.pt4y]], np.int32)
+                pts = pts.reshape((-1, 1, 2))
+                cv2.polylines(annotated_image, [pts], True, (0, 255, 0), 2)  # 绿色框
+                
+                # 计算中心点
+                center_x = (box.pt1x + box.pt2x + box.pt3x + box.pt4x) / 4.0
+                center_y = (box.pt1y + box.pt2y + box.pt3y + box.pt4y) / 4.0
+                center_x_int = int(center_x)
+                center_y_int = int(center_y)
+                
+                # 绘制中心点
+                cv2.circle(annotated_image, (center_x_int, center_y_int), 8, (255, 0, 0), -1)  # 蓝色实心圆
+                
+                # 绘制目标编号
+                cv2.putText(annotated_image, f"#{target_id}", 
+                           (center_x_int - 15, center_y_int - 15), 
+                           font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+                
+                # 计算并显示角度
+                angle_deg = 0.0
+                if hasattr(box, 'angle') and box.angle is not None:
+                    # 角度从弧度转换为度
+                    angle_deg = math.degrees(box.angle)
+                    # 规范化角度到 [0, 180) 范围
+                    angle_deg = angle_deg % 180
+                    if angle_deg < 0:
+                        angle_deg += 180
+                else:
+                    # 从四个角点计算角度
+                    try:
+                        # 获取四个角点
+                        points = [
+                            [box.pt1x, box.pt1y],
+                            [box.pt2x, box.pt2y], 
+                            [box.pt3x, box.pt3y],
+                            [box.pt4x, box.pt4y]
+                        ]
+                        
+                        # 计算所有边的长度和角度
+                        edges = []
+                        for j in range(4):
+                            k = (j + 1) % 4
+                            dx = points[k][0] - points[j][0]
+                            dy = points[k][1] - points[j][1]
+                            length = math.sqrt(dx*dx + dy*dy)
+                            angle = math.atan2(dy, dx)
+                            edges.append((length, angle, j))
+                        
+                        # 排序得到最长的两条边
+                        edges_sorted = sorted(edges, key=lambda x: x[0], reverse=True)
+                        longest_edge = edges_sorted[0]
+                        second_longest_edge = edges_sorted[1]
+                        
+                        # 检查最长边和第二长边的长度比
+                        length_ratio = longest_edge[0] / second_longest_edge[0]
+                        
+                        # 如果长度比接近1（正方形），选择更水平的边
+                        if length_ratio < 1.2:
+                            angle1 = abs(longest_edge[1]) % (math.pi/2)
+                            angle2 = abs(second_longest_edge[1]) % (math.pi/2)
+                            main_edge = longest_edge if angle1 < angle2 else second_longest_edge
+                        else:
+                            main_edge = longest_edge
+                        
+                        main_angle = main_edge[1]
+                        angle_deg = math.degrees(main_angle)
+                        
+                        # 规范化角度到 [0, 180) 范围
+                        angle_deg = angle_deg % 180
+                        if angle_deg < 0:
+                            angle_deg += 180
+                            
+                    except Exception as e:
+                        print(f"计算目标 {target_id} 角度失败: {e}")
+                        angle_deg = 0.0
+                
+                # 显示角度文本
+                angle_text = f"{angle_deg:.1f}°"
+                cv2.putText(annotated_image, angle_text,
+                           (center_x_int - 25, center_y_int + 25),
+                           font, 0.5, (0, 255, 255), thickness-1, cv2.LINE_AA)  # 黄色角度文本
+                
+                # 绘制角度指示线
+                try:
+                    line_length = 40
+                    angle_rad = math.radians(angle_deg)
+                    end_x = int(center_x + line_length * math.cos(angle_rad))
+                    end_y = int(center_y + line_length * math.sin(angle_rad))
+                    cv2.arrowedLine(annotated_image, (center_x_int, center_y_int), (end_x, end_y), 
+                                   (255, 0, 255), 2, tipLength=0.3)  # 紫色箭头
+                except Exception as e:
+                    print(f"绘制角度指示线失败: {e}")
+                
+                # 计算3D相机坐标系坐标
+                camera_3d = None
+                if depth_data and camera_params:
+                    try:
+                        # 获取深度值
+                        if (center_x_int >= 0 and center_x_int < camera_params.width and 
+                            center_y_int >= 0 and center_y_int < camera_params.height):
+                            
+                            depth_index = center_y_int * camera_params.width + center_x_int
+                            if depth_index < len(depth_data):
+                                depth_value = depth_data[depth_index]
+                                
+                                if depth_value > 0:  # 确保深度值有效
+                                    # 获取相机到世界坐标系的变换矩阵
+                                    m_c2w = None
+                                    if hasattr(camera_params, 'cam2worldMatrix') and len(camera_params.cam2worldMatrix) == 16:
+                                        m_c2w = np.array(camera_params.cam2worldMatrix).reshape(4, 4)
+                                    
+                                    # 使用_calculate_3d_fast方法进行准确的3D坐标计算
+                                    success, coords_3d = self._calculate_3d_fast(
+                                        center_x, center_y, depth_value,
+                                        camera_params.cx, camera_params.cy,
+                                        camera_params.fx, camera_params.fy,
+                                        camera_params.k1, camera_params.k2,
+                                        camera_params.f2rc, m_c2w  # 使用相机的世界坐标变换矩阵
+                                    )
+                                    
+                                    if success:
+                                        camera_3d = coords_3d
+                                        x_mm, y_mm, z_mm = coords_3d
+                                        
+                                        # 在图像上显示3D坐标
+                                        coord_text = f"({x_mm:.1f},{y_mm:.1f},{z_mm:.1f})"
+                                        cv2.putText(annotated_image, coord_text,
+                                                   (center_x_int - 50, center_y_int + 45),
+                                                   font, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                                    
+                    except Exception as e:
+                        print(f"计算目标 {target_id} 3D坐标失败: {e}")
+                
+                # 添加到坐标信息列表
+                detection_info = {
+                    'target_id': target_id,
+                    'center_2d': [center_x, center_y],
+                    'camera_3d': camera_3d,
+                    'angle': angle_deg,
+                    'score': box.score,
+                    'class_id': box.classId,
+                    'bbox_corners': [
+                        [box.pt1x, box.pt1y],
+                        [box.pt2x, box.pt2y],
+                        [box.pt3x, box.pt3y],
+                        [box.pt4x, box.pt4y]
+                    ],
+                    'original_result': box
+                }
+                detection_coordinates.append(detection_info)
+            
+            # 在图像顶部显示检测信息
+            info_text = f"Detected Targets: {len(detection_results)}"
+            cv2.putText(annotated_image, info_text, (10, 25), 
+                       font, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            
+            return annotated_image, detection_coordinates
+            
+        except Exception as e:
+            print(f"标定检测过程中出错: {e}")
+            # 返回原图像和空坐标列表
+            return image.copy() if image is not None else None, []
+
     def detect_with_coordinates(self, image, depth_data=None, camera_params=None, draw_annotations=True, roi_config=None):
         """
         检测并返回带坐标转换的结果，可选绘制检测框和标注

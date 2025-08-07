@@ -1,20 +1,26 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 """
-@Description :   this moudle is used to control the sick vision device and get the data.
-                 The common module in the folder is required
-@Author      :   Cao Yingjie
-@Time        :   2025/04/23 08:47:44
+VisionCore SICK相机SDK封装
+提供相机连接、图像获取和标定功能
 """
 
+import logging
+import time
+import cv2
+import numpy as np
+import math
+import socket
+from typing import Tuple, Optional, Any, Dict
+from utils.decorators import retry, require_connection, safe_disconnect
+from utils.calculator import CoordinateCalculator
+
+# 导入SICK相机相关的类
 from common.Control import Control
 from common.Streaming import Data
 from common.Stream import Streaming
 from common.Streaming.BlobServerConfiguration import BlobClientConfig
-from utils.decorators import retry, require_connection, safe_disconnect
-import cv2
-import numpy as np
-import time
-import socket
-import logging
 
 class QtVisionSick:
     """
@@ -411,7 +417,6 @@ class QtVisionSick:
         """确保在销毁时断开连接"""
         self.logger.info("相机连接已销毁,释放资源")
         self.disconnect()
-
     
 
   

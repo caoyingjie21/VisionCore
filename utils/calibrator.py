@@ -515,6 +515,75 @@ class CoordinateCalibrator:
         
         print("=" * 60)
 
+    def calculate_3d_transformation_matrix(self, camera_points, robot_points):
+        """
+        计算完整的3D变换矩阵
+        
+        Args:
+            camera_points: 相机坐标系中的点 [[x, y, z], ...]
+            robot_points: 机器人坐标系中的点 [[x, y, z], ...]
+            
+        Returns:
+            dict: 包含变换结果的字典
+        """
+        if len(camera_points) != len(robot_points):
+            raise ValueError("相机坐标点和机器人坐标点数量必须相同")
+            
+        if len(camera_points) < 4:
+            raise ValueError("至少需要4组对应点来计算3D变换矩阵")
+            
+        camera_points = np.array(camera_points, dtype=np.float64)
+        robot_points = np.array(robot_points, dtype=np.float64)
+        
+        # 保存标定点数量
+        self.calibration_points_count = len(camera_points)
+        
+        # 使用齐次坐标进行变换矩阵计算
+        # 将3D点转换为齐次坐标（添加第4维为1）
+        camera_homogeneous = np.hstack([camera_points, np.ones((len(camera_points), 1))])
+        robot_homogeneous = np.hstack([robot_points, np.ones((len(robot_points), 1))])
+        
+        try:
+            # 使用伪逆求解变换矩阵
+            # 对于齐次变换矩阵 T，有：robot_homogeneous.T = T @ camera_homogeneous.T
+            # 求解：T = robot_homogeneous.T @ pinv(camera_homogeneous.T)
+            camera_homogeneous_T = camera_homogeneous.T
+            robot_homogeneous_T = robot_homogeneous.T
+            
+            # 计算伪逆
+            camera_pinv = np.linalg.pinv(camera_homogeneous_T)
+            self.transformation_matrix = robot_homogeneous_T @ camera_pinv
+            
+            # 确保变换矩阵的最后一行是 [0, 0, 0, 1]
+            self.transformation_matrix[3, :] = [0, 0, 0, 1]
+            
+        except np.linalg.LinAlgError as e:
+            raise ValueError(f"变换矩阵计算失败: {str(e)}")
+        
+        # 验证变换质量
+        validation_results = self._validate_transformation(camera_points, robot_points)
+        self.calibration_rmse = validation_results['total_rmse']
+        
+        # 设置标定元数据
+        self.calibration_metadata = {
+            'calibration_points_count': self.calibration_points_count,
+            'calibration_rmse': self.calibration_rmse,
+            'transformation_type': 'complete_3d',
+            'matrix_size': '4x4',
+            'calibration_datetime': datetime.now().isoformat(),
+            'validation_results': validation_results
+        }
+        
+        # 保存变换矩阵
+        self.save_transformation_matrix()
+        
+        return {
+            'transformation_matrix': self.transformation_matrix,
+            'validation_results': validation_results,
+            'calibration_points_count': self.calibration_points_count,
+            'calibration_rmse': self.calibration_rmse
+        }
+
 
 # 兼容性别名
 Calibrator = CoordinateCalibrator 

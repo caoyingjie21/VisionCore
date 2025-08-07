@@ -26,6 +26,9 @@ class VisionCoreCommands(Enum):
     # 模型测试命令
     MODEL_TEST = "model_test"
     
+    # 坐标标定命令
+    COORDINATE_CALIBRATION = "coordinate_calibration"
+    
     def __eq__(self, other):
         """允许枚举直接与字符串比较"""
         if isinstance(other, str):
@@ -57,7 +60,8 @@ class VisionCoreCommands(Enum):
             cls.SFTP_TEST.value: "SFTP连接测试，上传test.png文件到服务器",
             cls.GET_SYSTEM_STATUS.value: "获取系统健康状态和组件信息",
             cls.MODEL_TEST.value: "执行模型测试",
-            cls.ERROR_TIP.value: "获取错误提示"
+            cls.ERROR_TIP.value: "获取错误提示",
+            cls.COORDINATE_CALIBRATION.value: "执行坐标系标定，检测目标并计算变换矩阵"
         }
         return descriptions.get(command, "未知命令")
 

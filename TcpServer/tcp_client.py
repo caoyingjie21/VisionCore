@@ -148,7 +148,7 @@ class TcpClient:
 def main():
     """主函数"""
     # 创建客户端
-    client = TcpClient("192.168.2.100", 8888)
+    client = TcpClient("192.168.2.20", 8888)
     
     # 运行交互式客户端
     client.run_interactive()

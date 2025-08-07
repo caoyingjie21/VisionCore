@@ -228,9 +228,9 @@ class VisionCoreApp:
             enable_stability = configManager.get_config("stability.isEnabled")
             enable_stability = enable_stability if enable_stability is not None else False
             
-            # 执行检测（单步模式推荐使用单次检测）
+            # 只使用单步检测，经过实验，单步检测的稳定性比稳定检测要好，且单步检测耗时与稳定性检测耗时相差不大
             if enable_stability and not camera.use_single_step:
-                final_result = self._perform_stable_detection(client_id, camera, detector, configManager)
+                final_result = self._perform_single_detection(camera, detector, configManager)
             else:
                 final_result = self._perform_single_detection(camera, detector, configManager)
             
@@ -278,277 +278,6 @@ class VisionCoreApp:
             # 清除处理标志，允许后续命令处理
             if client_id in self.tcp_processing_flags:
                 self.tcp_processing_flags[client_id] = False
-    
-    def _perform_stable_detection(self, client_id: str, camera, detector, configManager):
-        """
-        执行稳定性检测，直到连续两次结果稳定或达到最大检测次数
-        
-        Args:
-            client_id: 客户端ID
-            camera: 相机实例
-            detector: 检测器实例
-            configManager: 配置管理器
-            
-        Returns:
-            dict: 最终检测结果
-        """
-        logger = self.initializer.logger
-        detection_results = []
-        last_stable_result = None
-        
-        stability_num = configManager.get_config("stability.detectionCount")
-        stability_num = stability_num if stability_num is not None else 5
-        
-        # 从配置获取稳定性检测延迟
-        stabilize_delay = configManager.get_config("camera.buffer.stabilizeDelay")
-        stabilize_delay = stabilize_delay if stabilize_delay is not None else 0.1
-        
-        logger.info(f"开始稳定性检测，最大尝试次数: {stability_num}")
-        
-        for attempt in range(stability_num):
-            try:
-                # 在检测之间添加配置的延迟，确保相机缓冲区稳定
-                if attempt > 0:
-                    time.sleep(stabilize_delay)
-                
-                # 执行2D检测（带重试机制）
-                detection_result = self._perform_2d_detection_with_retry(camera, detector, configManager, attempt + 1)
-                
-                if detection_result is None:
-                    continue
-                        
-                detection_results.append(detection_result)
-                
-                # 如果是第一次检测，记录结果并继续
-                if attempt == 0:
-                    continue
-                
-                # 从第二次开始检查稳定性
-                previous_result = detection_results[attempt - 1]
-                current_result = detection_result
-                
-                # 检查稳定性（基于2D坐标）
-                is_stable = self._check_detection_stability(current_result, previous_result)
-                
-                if is_stable:
-                    logger.info(f"检测稳定，开始3D坐标计算")
-                    # 检测稳定后，进行3D坐标转换
-                    final_result = self._perform_3d_coordinate_calculation(current_result, camera, detector, configManager)
-                    last_stable_result = final_result
-                    break
-                    
-            except Exception as e:
-                logger.error(f"第{attempt + 1}次稳定性检测时出错: {str(e)}")
-                continue
-        
-        # 如果没有达到稳定状态，使用最后一次检测结果
-        if last_stable_result is None and detection_results:
-            logger.warning("未达到稳定状态，使用最后一次检测结果")
-            last_result = detection_results[-1]
-            last_stable_result = self._perform_3d_coordinate_calculation(last_result, camera, detector, configManager)
-            
-        return last_stable_result
-
-    def _perform_2d_detection_with_retry(self, camera, detector, configManager, attempt_num):
-        """
-        执行2D检测，带重试机制处理缓冲区错误
-        
-        Args:
-            camera: 相机实例
-            detector: 检测器实例
-            configManager: 配置管理器
-            attempt_num: 检测尝试次数
-        
-        Returns:
-            dict: 2D检测结果字典
-        """
-        logger = self.initializer.logger
-        
-        # 从配置获取重试参数
-        max_retries = configManager.get_config("camera.buffer.retryAttempts")
-        max_retries = max_retries if max_retries is not None else 3
-        
-        retry_delay = configManager.get_config("camera.buffer.retryDelay")
-        retry_delay = retry_delay if retry_delay is not None else 0.2
-        
-        for retry in range(max_retries):
-            try:
-                # 记录检测流程的开始时间
-                total_start_time = time.time()
-                
-                # 获取相机帧数据，带错误处理
-                frame_start_time = time.time()
-                success, depth_data, frame, camera_params = self._get_camera_frame_safe(camera, retry, configManager)
-                frame_time = (time.time() - frame_start_time) * 1000  # 转换为毫秒
-                
-                if not success or frame is None:
-                    if retry < max_retries - 1:
-                        time.sleep(retry_delay)
-                        continue
-                    else:
-                        logger.error(f"检测所有重试均失败")
-                        return None
-                
-                # 如果ROI启用，对图像进行ROI裁剪
-                enable_roi = configManager.get_config("roi.enable")
-                enable_roi = enable_roi if enable_roi is not None else False
-                if enable_roi:
-                    roi_config = self._get_roi_config()
-                frame = self._apply_roi_to_image(frame, roi_config)
-                        
-                        # 执行检测
-                detect_start_time = time.time()
-                results = detector.detect(frame)
-                detect_time = (time.time() - detect_start_time) * 1000  # 转换为毫秒
-                
-                # ROI过滤和2D结果处理
-                roi_start_time = time.time()
-                detection_count = 0
-                filtered_results_for_display = []
-                best_target_2d = None
-                
-                if results:
-                    # 获取图像尺寸
-                    image_height, image_width = frame.shape[:2]
-                    
-                    for result in results:
-                        if not (hasattr(result, 'pt1x') and hasattr(result, 'pt1y')):
-                            continue
-                        
-                        # 计算检测框中心点
-                        center_x = (result.pt1x + result.pt2x + result.pt3x + result.pt4x) / 4
-                        center_y = (result.pt1y + result.pt2y + result.pt3y + result.pt4y) / 4
-                        
-                        # ROI过滤（如果启用）
-                        if enable_roi:
-                            if not self._is_detection_in_roi_fast(center_x, center_y, image_width, image_height):
-                                continue
-                        
-                        detection_count += 1
-                        filtered_results_for_display.append(result)
-                        
-                        # 记录第一个有效目标作为最佳目标（简化版）
-                        if best_target_2d is None:
-                            best_target_2d = {
-                                'center': [center_x, center_y],
-                                'corners': [
-                                    [result.pt1x, result.pt1y],
-                                    [result.pt2x, result.pt2y],
-                                    [result.pt3x, result.pt3y],
-                                    [result.pt4x, result.pt4y]
-                                ],
-                                'result': result
-                            }
-                
-                roi_time = (time.time() - roi_start_time) * 1000  # 转换为毫秒
-                total_time = (time.time() - total_start_time) * 1000
-                
-                # 构造2D检测结果
-                detection_result = {
-                    'detection_count': detection_count,
-                    'best_target_2d': best_target_2d,
-                    'timing': {
-                        'frame_time': frame_time,
-                        'detect_time': detect_time,
-                        'roi_time': roi_time,
-                        'total_time': total_time
-                    },
-                    'raw_data': {
-                        'results': results,
-                        'depth_data': depth_data,
-                        'camera_params': camera_params,
-                        'frame': frame,
-                        'filtered_results': filtered_results_for_display
-                    }
-                }
-                
-                return detection_result
-                
-            except Exception as e:
-                if "buffer" in str(e).lower() or "magic word" in str(e).lower():
-                    logger.warning(f"第{attempt_num}次检测第{retry + 1}次遇到缓冲区错误: {str(e)}")
-                    if retry < max_retries - 1:
-                        # 缓冲区错误时，尝试清理缓冲区
-                        self._clear_camera_buffer(camera, configManager)
-                        time.sleep(retry_delay * 1.5)  # 缓冲区错误时等待更长时间
-                        continue
-                    else:
-                        logger.error(f"第{attempt_num}次检测第{retry + 1}次其他错误: {str(e)}")
-                    if retry < max_retries - 1:
-                        time.sleep(retry_delay / 2)  # 其他错误时等待较短时间
-                        continue
-                
-        return None
-
-    def _get_camera_frame_safe(self, camera, retry_count, configManager=None):
-        """
-        安全获取相机帧数据，处理缓冲区错误
-        
-        Args:
-            camera: 相机实例
-            retry_count: 重试次数
-            configManager: 配置管理器（可选）
-            
-        Returns:
-            tuple: (success, depth_data, frame, camera_params)
-        """
-        logger = self.initializer.logger
-        
-        try:
-            if retry_count == 0:
-                # 第一次尝试使用get_fresh_frame
-                return camera.get_fresh_frame()
-            else:
-                # 重试时也使用get_fresh_frame，保持性能一致
-                return camera.get_fresh_frame()
-                
-        except Exception as e:
-            if "buffer" in str(e).lower() or "magic word" in str(e).lower():
-                logger.warning(f"相机缓冲区错误: {str(e)}")
-                # 尝试清理缓冲区
-                self._clear_camera_buffer(camera, configManager)
-                return False, None, None, None
-            else:
-                logger.error(f"相机获取帧时出错: {str(e)}")
-                return False, None, None, None
-
-    def _clear_camera_buffer(self, camera, configManager=None):
-        """
-        清理相机缓冲区，尝试恢复正常状态
-        
-        Args:
-            camera: 相机实例
-            configManager: 配置管理器（可选）
-        """
-        logger = self.initializer.logger
-        
-        # 从配置获取清理参数
-        clear_attempts = 5
-        if configManager:
-            clear_attempts = configManager.get_config("camera.buffer.clearAttempts")
-            clear_attempts = clear_attempts if clear_attempts is not None else 5
-        
-        try:
-            # 尝试重新连接相机以清理缓冲区
-            if hasattr(camera, 'streaming_device') and camera.streaming_device:
-                old_timeout = camera.streaming_device.sock_stream.gettimeout()
-                # 设置很短的超时时间，快速清理缓冲区
-                camera.streaming_device.sock_stream.settimeout(0.01)
-                
-                # 尝试读取并丢弃缓冲区中的数据
-                for i in range(clear_attempts):
-                    try:
-                        camera.streaming_device.getFrame()
-                        logger.debug(f"清理缓冲区第{i+1}次")
-                    except:
-                        break
-                
-                # 恢复原始超时设置
-                camera.streaming_device.sock_stream.settimeout(old_timeout)
-                logger.debug("相机缓冲区清理完成")
-                
-        except Exception as e:
-            logger.debug(f"清理相机缓冲区时出错: {str(e)}")
 
     def _perform_single_detection(self, camera, detector: RKNN_YOLO, configManager):
         """
@@ -885,10 +614,6 @@ class VisionCoreApp:
             logger.debug(f"消息内容: {payload}")
 
             
-            
-            # # 根据主题处理不同的消息
-            # if topic == "sickvision/config/update":
-            #     self._handle_mqtt_config_update(payload)
             if topic == "sickvision/system/command":
                 self._handle_mqtt_system_command(payload)
             else:
@@ -1266,6 +991,148 @@ class VisionCoreApp:
                 mqtt_client.send_mqtt_response(response)
         except Exception as e:
             self.initializer.logger.error(f"发送配置响应失败: {e}")
+
+    def _handle_coordinate_calibration(self, payload, logger):
+        """处理坐标标定"""
+        logger.info(f"收到坐标标定命令: {payload}")
+        
+        try:
+            # 导入必要的类
+            from ClassModel.CalibrationData import CoordinateCalibrationCommand
+            from utils.calibrator import CoordinateCalibrator
+            
+            # 解析标定命令
+            try:
+                calibration_command = CoordinateCalibrationCommand.from_mqtt_payload(payload)
+                logger.info(f"解析标定命令成功，包含 {calibration_command.data.get_points_count()} 个标定点")
+            except ValueError as e:
+                error_msg = f"解析标定命令失败: {e}"
+                logger.error(error_msg)
+                response = MQTTResponse(
+                    command=VisionCoreCommands.COORDINATE_CALIBRATION.value,
+                    component="calibrator",
+                    messageType=MessageType.ERROR,
+                    message=error_msg,
+                    data={}
+                )
+                mqtt_client = self.initializer.get_mqtt_client()
+                if mqtt_client:
+                    mqtt_client.send_mqtt_response(response)
+                return
+            
+            # 验证数据有效性
+            if not calibration_command.data.validate():
+                error_msg = "标定数据验证失败，请检查数据格式和完整性"
+                logger.error(error_msg)
+                response = MQTTResponse(
+                    command=VisionCoreCommands.COORDINATE_CALIBRATION.value,
+                    component="calibrator",
+                    messageType=MessageType.ERROR,
+                    message=error_msg,
+                    data={}
+                )
+                mqtt_client = self.initializer.get_mqtt_client()
+                if mqtt_client:
+                    mqtt_client.send_mqtt_response(response)
+                return
+            
+            # 检查标定点数量
+            points_count = calibration_command.data.get_points_count()
+            if points_count < 4:
+                error_msg = f"标定点数量不足，至少需要4个点，当前只有{points_count}个"
+                logger.error(error_msg)
+                response = MQTTResponse(
+                    command=VisionCoreCommands.COORDINATE_CALIBRATION.value,
+                    component="calibrator",
+                    messageType=MessageType.ERROR,
+                    message=error_msg,
+                    data={"required_points": 4, "current_points": points_count}
+                )
+                mqtt_client = self.initializer.get_mqtt_client()
+                if mqtt_client:
+                    mqtt_client.send_mqtt_response(response)
+                return
+            
+            # 创建标定器并进行标定
+            try:
+                calibrator = CoordinateCalibrator()
+                
+                # 获取相机坐标点和机器人坐标点
+                camera_points = calibration_command.data.get_camera_points()
+                robot_points = calibration_command.data.get_robot_points()
+                
+                logger.info(f"开始计算变换矩阵，使用{points_count}个标定点...")
+                
+                # 显示标定点信息
+                for i, (cam_point, rob_point) in enumerate(zip(camera_points, robot_points), 1):
+                    logger.info(f"标定点{i}: 相机{cam_point} -> 机器人{rob_point}")
+                
+                # 计算3D变换矩阵
+                calibration_result = calibrator.calculate_3d_transformation_matrix(
+                    camera_points, robot_points
+                )
+                
+                # 获取质量评估
+                quality_assessment = calibrator.get_calibration_quality_assessment()
+                
+                logger.info(f"标定计算完成！")
+                logger.info(f"RMSE: {calibration_result['calibration_rmse']:.3f}mm")
+                logger.info(f"质量评估: {quality_assessment['quality_message']}")
+                logger.info(f"建议: {quality_assessment['recommendation']}")
+                
+                # 构造成功响应
+                success_msg = f"坐标系标定完成，RMSE: {calibration_result['calibration_rmse']:.3f}mm"
+                response_data = {
+                    "calibration_rmse": calibration_result['calibration_rmse'],
+                    "calibration_points_count": calibration_result['calibration_points_count'],
+                    "quality_assessment": quality_assessment,
+                    "validation_results": calibration_result['validation_results'],
+                    "transformation_matrix": calibration_result['transformation_matrix'].tolist(),
+                    "calibration_datetime": calibration_command.date_time
+                }
+                
+                response = MQTTResponse(
+                    command=VisionCoreCommands.COORDINATE_CALIBRATION.value,
+                    component="calibrator",
+                    messageType=MessageType.SUCCESS,
+                    message=success_msg,
+                    data=response_data
+                )
+                
+                # 发送成功响应
+                mqtt_client = self.initializer.get_mqtt_client()
+                if mqtt_client:
+                    mqtt_client.send_mqtt_response(response)
+                
+                logger.info("坐标系标定响应已发送")
+                
+            except Exception as calc_error:
+                error_msg = f"标定计算失败: {calc_error}"
+                logger.error(error_msg, exc_info=True)
+                response = MQTTResponse(
+                    command=VisionCoreCommands.COORDINATE_CALIBRATION.value,
+                    component="calibrator",
+                    messageType=MessageType.ERROR,
+                    message=error_msg,
+                    data={"error_type": "calculation_failed"}
+                )
+                mqtt_client = self.initializer.get_mqtt_client()
+                if mqtt_client:
+                    mqtt_client.send_mqtt_response(response)
+                
+        except Exception as e:
+            error_msg = f"处理坐标标定命令时出错: {e}"
+            logger.error(error_msg, exc_info=True)
+            response = MQTTResponse(
+                command=VisionCoreCommands.COORDINATE_CALIBRATION.value,
+                component="system",
+                messageType=MessageType.ERROR,
+                message=error_msg,
+                data={"error_type": "system_error"}
+            )
+            mqtt_client = self.initializer.get_mqtt_client()
+            if mqtt_client:
+                mqtt_client.send_mqtt_response(response)
     
     def _handle_mqtt_system_command(self, payload):
         """处理系统命令"""
@@ -1340,8 +1207,10 @@ class VisionCoreApp:
             # 获取标定图像
             elif command == VisionCoreCommands.GET_CALIBRAT_IMAGE:
                 try:
-                    # 获取相机
+                    # 获取相机、检测器
                     camera = self.initializer.get_camera()
+                    detector = self.initializer.get_detector()
+                    
                     if not camera:
                         error_msg = "相机未连接或未初始化"
                         logger.error(error_msg)
@@ -1357,10 +1226,25 @@ class VisionCoreApp:
                             mqtt_client.send_mqtt_response(response)
                         return
                     
-                    # 获取标定图像
+                    if not detector:
+                        error_msg = "检测器未连接或未初始化"
+                        logger.error(error_msg)
+                        response = MQTTResponse(
+                            command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                            component="detector",
+                            messageType=MessageType.ERROR,
+                            message=error_msg,
+                            data={}
+                        )
+                        mqtt_client = self.initializer.get_mqtt_client()
+                        if mqtt_client:
+                            mqtt_client.send_mqtt_response(response)
+                        return
+                    
+                    # 获取标定图像和深度数据
                     try:
-                        _, _, image, _ = camera.get_fresh_frame()
-                        if image is None:
+                        success, depth_data, image, camera_params = camera.get_fresh_frame()
+                        if not success or image is None:
                             error_msg = "无法获取标定图像"
                             logger.error(error_msg)
                             response = MQTTResponse(
@@ -1375,19 +1259,137 @@ class VisionCoreApp:
                                 mqtt_client.send_mqtt_response(response)
                             return
                         
-                        success_msg = f"标定图像获取成功，图像尺寸: {image.shape}"
-                        logger.info(success_msg)
-                        
-                        response = MQTTResponse(
-                            command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
-                            component="camera",
-                            messageType=MessageType.SUCCESS,
-                            message=success_msg,
-                            data={
-                                "image_shape": list(image.shape),
-                                "image_type": str(type(image))
-                            }
+                        # 使用检测器进行标定检测
+                        annotated_image, detection_coordinates = detector.detect_calibration(
+                            image, depth_data, camera_params
                         )
+                        
+                        detection_count = len(detection_coordinates)
+                        logger.info(f"标定检测完成，检测到 {detection_count} 个目标")
+                        
+                        # 根据检测数量进行不同处理
+                        if detection_count == 0:
+                            error_msg = "未检测到任何目标，请调整物体位置或相机角度"
+                            logger.warning(error_msg)
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                component="detector",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={
+                                    "detection_count": detection_count,
+                                    "error_type": "no_target"
+                                }
+                            )
+                        elif detection_count > 1:
+                            error_msg = f"检测到多个目标({detection_count}个)，标定需要单个目标，请移除多余物体"
+                            logger.warning(error_msg)
+                            response = MQTTResponse(
+                                command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                component="detector",
+                                messageType=MessageType.ERROR,
+                                message=error_msg,
+                                data={
+                                    "detection_count": detection_count,
+                                    "error_type": "multiple_targets"
+                                }
+                            )
+                        else:
+                            # 检测数量等于1，处理成功
+                            target_info = detection_coordinates[0]
+                            camera_3d = target_info.get('camera_3d')
+                            
+                            if camera_3d is None:
+                                error_msg = "无法计算目标的3D坐标，请检查深度数据"
+                                logger.error(error_msg)
+                                response = MQTTResponse(
+                                    command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                    component="detector",
+                                    messageType=MessageType.ERROR,
+                                    message=error_msg,
+                                    data={
+                                        "detection_count": detection_count,
+                                        "error_type": "no_3d_coordinate"
+                                    }
+                                )
+                            else:
+                                # 上传图像到SFTP
+                                try:
+                                    sftp_client = self.initializer.get_sftp_client()
+                                    if sftp_client:
+                                        # 上传图像，使用正确的参数
+                                        result = sftp_client.upload_image(
+                                            image_data=annotated_image,
+                                            image_format="jpg",
+                                            prefix="calibration",
+                                            remote_path=None
+                                        )
+                                        
+                                        if result["success"]:
+                                            x, y, z = camera_3d
+                                            angle = target_info.get('angle', 0.0)
+                                            
+                                            success_msg = f"标定图像上传成功，检测到1个目标"
+                                            logger.info(success_msg)
+                                            
+                                            response = MQTTResponse(
+                                                command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                                component="detector",
+                                                messageType=MessageType.SUCCESS,
+                                                message=success_msg,
+                                                data={
+                                                    "detection_count": detection_count,
+                                                    "image_path": result["filename"],
+                                                    "target_coordinates": {
+                                                        "x": round(x, 3),
+                                                        "y": round(y, 3),
+                                                        "z": round(z, 3),
+                                                        "angle": round(angle, 3)
+                                                    },
+                                                }
+                                            )
+                                        else:
+                                            error_msg = f"图像上传SFTP失败: {result['message']}"
+                                            logger.error(error_msg)
+                                            response = MQTTResponse(
+                                                command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                                component="sftp",
+                                                messageType=MessageType.ERROR,
+                                                message=error_msg,
+                                                data={
+                                                    "detection_count": detection_count,
+                                                    "error_type": "upload_failed"
+                                                }
+                                            )
+                                    else:
+                                        error_msg = "SFTP客户端未初始化"
+                                        logger.error(error_msg)
+                                        response = MQTTResponse(
+                                            command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                            component="sftp",
+                                            messageType=MessageType.ERROR,
+                                            message=error_msg,
+                                            data={
+                                                "detection_count": detection_count,
+                                                "error_type": "sftp_not_initialized"
+                                            }
+                                        )
+                                        
+                                except Exception as upload_error:
+                                    error_msg = f"上传图像时出错: {upload_error}"
+                                    logger.error(error_msg)
+                                    response = MQTTResponse(
+                                        command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
+                                        component="sftp",
+                                        messageType=MessageType.ERROR,
+                                        message=error_msg,
+                                        data={
+                                            "detection_count": detection_count,
+                                            "error_type": "upload_exception"
+                                        }
+                                    )
+                        
+                        # 发送响应
                         mqtt_client = self.initializer.get_mqtt_client()
                         if mqtt_client:
                             mqtt_client.send_mqtt_response(response)
@@ -1468,7 +1470,7 @@ class VisionCoreApp:
                     logger.error(error_msg)
                     response = MQTTResponse(
                         command=VisionCoreCommands.GET_CALIBRAT_IMAGE.value,
-                        component="camera",
+                        component="system",
                         messageType=MessageType.ERROR,
                         message=error_msg,
                         data={}
@@ -1939,6 +1941,10 @@ class VisionCoreApp:
                     mqtt_client = self.initializer.get_mqtt_client()
                     if mqtt_client:
                         mqtt_client.send_mqtt_response(response)            
+            # 坐标系标定
+            elif command == VisionCoreCommands.COORDINATE_CALIBRATION:
+                self._handle_coordinate_calibration(payload, logger)
+            
             else:
                 logger.warning(f"未知系统命令: {command}")
                 # 可以添加支持命令的提示
